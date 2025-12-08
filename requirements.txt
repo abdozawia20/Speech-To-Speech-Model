@@ -1,0 +1,7 @@
+faster-whisper
+datasets==3.6.0
+torch
+librosa
+matplotlib
+transformers
+numpy
