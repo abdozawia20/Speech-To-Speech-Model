@@ -28,21 +28,30 @@ def test_stt_dynamic_loading():
     print(f"STT switched to engine: {stt.current_engine_name}")
 
 def test_tts_dynamic_loading():
-    print("\n--- Testing TTS Dynamic Loading ---")
-    tts = TTS_model(model_name="en_US-lessac-medium")
-    print(f"TTS initialized with '{tts.current_model_name}'.")
-    assert tts.current_model_name == "en_US-lessac-medium"
+    print("\n--- Testing TTS Multi-Engine Loading ---")
+    tts = TTS_model(engine="piper", model_name="en_US-lessac-medium")
+    print(f"TTS initialized with engine: {tts.current_engine_name}")
+    assert tts.current_engine_name == "piper"
 
-    print("Switching TTS to 'en_US-lessac-high'...")
-    tts.load_model("en_US-lessac-high")
-    print(f"TTS switched to '{tts.current_model_name}'.")
-    assert tts.current_model_name == "en_US-lessac-high"
+    print("Switching TTS engine to 'system' (pyttsx3)...")
+    tts.load_engine("system")
+    print(f"TTS switched to engine: {tts.current_engine_name}")
+    assert tts.current_engine_name == "system"
     
-    # Verify files check
+    # Test dummy inference (optional, might make sound)
+    # print("Testing System TTS generation...")
+    # tts.run_inference("Hello from System TTS")
+
+    print("Switching TTS engine back to 'piper'...")
+    tts.load_engine("piper", model_name="en_US-lessac-high")
+    print(f"TTS switched to engine: {tts.current_engine_name}")
+    assert tts.current_engine_name == "piper"
+    
+    # Verify Piper model file exists
     if os.path.exists("en_US-lessac-high.onnx"):
-        print("Model file 'en_US-lessac-high.onnx' verified.")
+        print("Piper model file 'en_US-lessac-high.onnx' verified.")
     else:
-        print("Error: Model file 'en_US-lessac-high.onnx' missing.")
+        print("Error: Piper model file missing.")
 
 if __name__ == "__main__":
     try:

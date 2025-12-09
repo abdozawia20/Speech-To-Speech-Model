@@ -52,7 +52,15 @@ if platform.system() != "Windows":
 # 1. Download the Piper Binary
 # Using the stable 2023.11.14-2 release
 
-class TTS_model():
+# Base Interface
+class TTSEngine:
+    def load_model(self, model_name):
+        pass
+    def run_inference(self, text_input):
+        raise NotImplementedError
+
+# Concrete Implementation: Piper (Offline, High Quality)
+class PiperEngine(TTSEngine):
     # Define available voice models (name -> {onnx_url, json_url})
     VOICE_MODELS = {
         "en_US-lessac-medium": {
@@ -72,6 +80,7 @@ class TTS_model():
     def __init__(self, model_name="en_US-lessac-medium"):
         self.current_model_name = None
         self.piper_binary = None
+        self.piper_url = None
         
         # OS Detection
         self.system = platform.system()
@@ -115,7 +124,7 @@ class TTS_model():
         print(f"Loading voice model: {model_name}...")
         model_info = self.VOICE_MODELS[model_name]
         
-        # Define file names for the model (flat structure for simplicity, or use subfolders if preferred)
+        # Define file names 
         onnx_filename = f"{model_name}.onnx"
         json_filename = f"{model_name}.onnx.json"
 
@@ -137,47 +146,156 @@ class TTS_model():
         
 
     def validate(self):
-        # 3. Locate the binary (Safety Check)
+        # Locate the binary
         self.piper_binary = f"./piper/{self.executable_name}"
         if not os.path.exists(self.piper_binary):
             print("Standard path not found. Searching...")
             # Fallback search
-            result = subprocess.run(["find", ".", "-name", self.executable_name, "-type", "f", "-executable"], capture_output=True, text=True) if self.system != "Windows" else subprocess.run(["dir", "/s", "/b", self.executable_name], shell=True, capture_output=True, text=True)
-            
-            # Windows 'dir' output parsing vs linux 'find'
-            output = result.stdout.strip().splitlines()
-            if output:
-                 self.piper_binary = output[0]
-                 print(f"Found binary at: {self.piper_binary}")
-                 return True
-            else:
-                print(f"Could not find the '{self.executable_name}' executable after extraction.")
-                return False
+            try: 
+                result = subprocess.run(["find", ".", "-name", self.executable_name, "-type", "f", "-executable"], capture_output=True, text=True) if self.system != "Windows" else subprocess.run(["dir", "/s", "/b", self.executable_name], shell=True, capture_output=True, text=True)
+                output = result.stdout.strip().splitlines()
+                if output:
+                     self.piper_binary = output[0]
+                     print(f"Found binary at: {self.piper_binary}")
+                     return True
+            except Exception:
+                pass
+                
+            print(f"Could not find the '{self.executable_name}' executable after extraction.")
+            return False
         return True
 
     def run_inference(self, text_input):
-        print(f"Generating audio for the following text: \n '{text_input}'")
+        print(f"Generating audio for the following text (Piper): \n '{text_input}'")
         if not self.current_onnx_path:
              print("Error: No voice model loaded.")
              return None
 
         cmd = f'echo "{text_input}" | "{self.piper_binary}" --model {self.current_onnx_path} --output_file output.wav'
         try:
-             subprocess.run(cmd, shell=True, check=True)
+           # Windows Popen fix for pipes
+           if self.system == "Windows":
+               subprocess.run(cmd, shell=True, check=True)
+           else:
+               subprocess.run(cmd, shell=True, check=True)
+           
+           return "output.wav"
         except subprocess.CalledProcessError as e:
-             print(f"Error running piper: {e}")
-             return None
-
-        # 5. Return the result
-        if os.path.exists("output.wav") and os.path.getsize("output.wav") > 0:
-            return Audio("output.wav")
-        else:
-            print("Error: output.wav was not generated or is empty.")
+            print(f"Error running Piper: {e}")
             return None
 
+# Concrete Implementation: System (pyttsx3)
+class SystemEngine(TTSEngine):
+    def __init__(self, voice_id=None):
+        import pyttsx3 # Lazy import
+        try:
+            self.engine = pyttsx3.init()
+            if voice_id:
+                self.load_model(voice_id)
+        except Exception as e:
+            print(f"Error initializing system TTS: {e}")
+            self.engine = None
 
-import json
-import vosk
+    def load_model(self, model_name):
+        # model_name here refers to voice ID or index
+        if not self.engine: return
+        
+        voices = self.engine.getProperty('voices')
+        # Try to match by ID or Name
+        found = False
+        for v in voices:
+            if model_name in v.id or model_name in v.name:
+                self.engine.setProperty('voice', v.id)
+                print(f"System TTS Voice set to: {v.name}")
+                found = True
+                break
+        if not found:
+            print(f"Voice '{model_name}' not found. Using default.")
+
+    def run_inference(self, text_input):
+        import pyttsx3
+        if not self.engine:
+             return None
+        
+        print(f"Generating audio for the following text (System): \n '{text_input}'")
+        output_file = "output.wav"
+        try:
+            self.engine.save_to_file(text_input, output_file)
+            self.engine.runAndWait()
+            return output_file
+        except Exception as e:
+            print(f"Error running System TTS: {e}")
+            return None
+
+# Concrete Implementation: ElevenLabs (Placeholder)
+class ElevenLabsEngine(TTSEngine):
+    def __init__(self, api_key=None):
+        self.api_key = api_key or os.environ.get("ELEVEN_LABS_API_KEY")
+        if not self.api_key:
+            print("Warning: No ElevenLabs API key provided.")
+
+    def load_model(self, model_name):
+        print(f"ElevenLabs model '{model_name}' selected (Mock).")
+
+    def run_inference(self, text_input):
+        print("ElevenLabs inference requires valid API Key. (This is a placeholder)")
+        return None
+
+# Concrete Implementation: OpenAI (Placeholder)
+class OpenAIEngine(TTSEngine):
+    def __init__(self, api_key=None):
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+             print("Warning: No OpenAI API key provided.")
+    
+    def load_model(self, model_name):
+        print(f"OpenAI TTS model '{model_name}' selected (Mock).")
+
+    def run_inference(self, text_input):
+        print("OpenAI inference requires valid API Key. (This is a placeholder)")
+        return None
+
+# Facade for switching between TTS engines
+class TTS_model():
+    """
+    Facade for switching between TTS engines.
+    Engines: 'piper', 'system', 'elevenlabs', 'openai'
+    """
+    def __init__(self, engine="piper", **kwargs):
+        self.engine = None
+        self.current_engine_name = None
+        self.load_engine(engine, **kwargs)
+
+    def load_engine(self, engine_name, **kwargs):
+        engine_name = engine_name.lower()
+        print(f"Switching TTS Engine to: {engine_name}...")
+        
+        if engine_name == "piper":
+            model_name = kwargs.get("model_name", "en_US-lessac-medium")
+            self.engine = PiperEngine(model_name)
+        elif engine_name == "system":
+            self.engine = SystemEngine(kwargs.get("model_name"))
+        elif engine_name == "elevenlabs":
+            self.engine = ElevenLabsEngine(kwargs.get("api_key"))
+        elif engine_name == "openai":
+            self.engine = OpenAIEngine(kwargs.get("api_key"))
+        else:
+            print(f"Unknown engine '{engine_name}'. Defaulting to Piper.")
+            self.engine = PiperEngine()
+            engine_name = "piper"
+        
+        self.current_engine_name = engine_name
+
+    def load_model(self, model_name):
+        if self.engine:
+            self.engine.load_model(model_name)
+
+    def run_inference(self, text_input):
+        if self.engine:
+            return self.engine.run_inference(text_input)
+        return None
+
+
 
 class STTEngine:
     def load_model(self, model_name):
