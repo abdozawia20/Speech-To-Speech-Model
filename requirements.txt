@@ -7,3 +7,4 @@ transformers
 numpy
 ipython
 vosk
+pyttsx3
