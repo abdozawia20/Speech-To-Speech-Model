@@ -176,16 +176,16 @@ class TTS_model():
             return None
 
 
-import json
 import vosk
 
-class STTEngine:
-    def load_model(self, model_name):
+class STTBase:
+    # This implies that the user wants a model that isn't present in the library
+    def load_model(self, model_name, model_size="small"):
         raise NotImplementedError
     def transcribe(self, audio_array, sample_rate):
         raise NotImplementedError
 
-class WhisperEngine(STTEngine):
+class WhisperEngine(STTBase):
     def __init__(self, model_size="small"):
         self.model = None
         self.load_model(model_size)
@@ -207,6 +207,8 @@ class WhisperEngine(STTEngine):
             print(f"Error loading WhisperModel on {device}: {e}")
             print("Falling back to CPU int8...")
             self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        
+        return self.model
 
     def transcribe(self, audio_array, sample_rate):
         if audio_array is None or len(audio_array) == 0:
@@ -246,7 +248,7 @@ class WhisperEngine(STTEngine):
             print(f"Error during transcription: {e}")
             return ""
 
-class VoskEngine(STTEngine):
+class VoskEngine(STTBase):
     def __init__(self, model_name="vosk-model-small-en-us-0.15"):
         self.model = None
         self.rec = None
@@ -281,6 +283,9 @@ class VoskEngine(STTEngine):
             # KaldiRecognizer doesn't need init here per se, but useful to have
         else:
             print(f"Error: Vosk model path '{model_path}' does not exist.")
+            return None
+            
+        return self.model
 
     def transcribe(self, audio_array, sample_rate):
         import vosk # Lazy import
@@ -301,7 +306,7 @@ class VoskEngine(STTEngine):
         res = json.loads(rec.FinalResult())
         return res.get("text", "")
 
-class GoogleEngine(STTEngine):
+class GoogleEngine(STTBase):
     def __init__(self):
         print("Google Speech Engine initialized (Placeholder). Needs API Key.")
     def load_model(self, model_name):
@@ -309,7 +314,7 @@ class GoogleEngine(STTEngine):
     def transcribe(self, audio_array, sample_rate):
         return "[Google Speech Placeholder] Transcription requires API Key."
 
-class AssemblyAIEngine(STTEngine):
+class AssemblyAIEngine(STTBase):
     def __init__(self):
         print("AssemblyAI Engine initialized (Placeholder). Needs API Key.")
     def load_model(self, model_name):
@@ -317,7 +322,7 @@ class AssemblyAIEngine(STTEngine):
     def transcribe(self, audio_array, sample_rate):
         return "[AssemblyAI Placeholder] Transcription requires API Key."
 
-class STT_model():
+class STTEngine():
     """
     Facade for swtiching between STT engines.
     Engines: 'whisper', 'vosk', 'google', 'assemblyai'
@@ -335,8 +340,8 @@ class STT_model():
             model_size = kwargs.get("model_size", "small")
             self.engine = WhisperEngine(model_size)
         elif engine_name == "vosk":
-            model_name = kwargs.get("model_name", "vosk-model-small-en-us-0.15")
-            self.engine = VoskEngine(model_name)
+            model_size = kwargs.get("model_size", "small")
+            self.engine = VoskEngine(f"vosk-model-{model_size}-en-us-0.15")
         elif engine_name == "google":
             self.engine = GoogleEngine()
         elif engine_name == "assemblyai":
@@ -347,13 +352,9 @@ class STT_model():
             engine_name = "whisper"
         
         self.current_engine_name = engine_name
+        return self.engine.load_model(model_size)
 
-    def load_model(self, model_name):
-        # Delegate specific model loading to the engine if supported
-        if self.engine:
-            self.engine.load_model(model_name)
-
-    def run_inference(self, audio_array, sample_rate):
+    def transcribe(self, audio_array, sample_rate):
         if self.engine:
             return self.engine.transcribe(audio_array, sample_rate)
         return "Error: No engine loaded."
