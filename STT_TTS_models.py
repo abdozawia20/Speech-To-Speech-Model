@@ -49,18 +49,13 @@ if platform.system() != "Windows":
     except Exception as e:
         print(f"Warning: Error preloading nvidia libraries: {e}")
 
-# 1. Download the Piper Binary
-# Using the stable 2023.11.14-2 release
-
-# Base Interface
-class TTSEngine:
+class TTSBase:
     def load_model(self, model_name):
         pass
     def run_inference(self, text_input):
         raise NotImplementedError
 
-# Concrete Implementation: Piper (Offline, High Quality)
-class PiperEngine(TTSEngine):
+class PiperEngine(TTSBase):
     # Define available voice models (name -> {onnx_url, json_url})
     VOICE_MODELS = {
         "en_US-lessac-medium": {
@@ -184,8 +179,7 @@ class PiperEngine(TTSEngine):
             print(f"Error running Piper: {e}")
             return None
 
-# Concrete Implementation: System (pyttsx3)
-class SystemEngine(TTSEngine):
+class SystemEngine(TTSBase):
     def __init__(self, voice_id=None):
         import pyttsx3 # Lazy import
         try:
@@ -227,8 +221,7 @@ class SystemEngine(TTSEngine):
             print(f"Error running System TTS: {e}")
             return None
 
-# Concrete Implementation: ElevenLabs (Placeholder)
-class ElevenLabsEngine(TTSEngine):
+class ElevenLabsEngine(TTSBase):
     def __init__(self, api_key=None):
         self.api_key = api_key or os.environ.get("ELEVEN_LABS_API_KEY")
         if not self.api_key:
@@ -241,8 +234,7 @@ class ElevenLabsEngine(TTSEngine):
         print("ElevenLabs inference requires valid API Key. (This is a placeholder)")
         return None
 
-# Concrete Implementation: OpenAI (Placeholder)
-class OpenAIEngine(TTSEngine):
+class OpenAIEngine(TTSBase):
     def __init__(self, api_key=None):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         if not self.api_key:
@@ -255,8 +247,7 @@ class OpenAIEngine(TTSEngine):
         print("OpenAI inference requires valid API Key. (This is a placeholder)")
         return None
 
-# Facade for switching between TTS engines
-class TTS_model():
+class TTSEngine():
     """
     Facade for switching between TTS engines.
     Engines: 'piper', 'system', 'elevenlabs', 'openai'
@@ -271,8 +262,8 @@ class TTS_model():
         print(f"Switching TTS Engine to: {engine_name}...")
         
         if engine_name == "piper":
-            model_name = kwargs.get("model_name", "en_US-lessac-medium")
-            self.engine = PiperEngine(model_name)
+            model_size = kwargs.get("model_size", "small")
+            self.engine = PiperEngine(f"en_US-lessac-{model_size}")
         elif engine_name == "system":
             self.engine = SystemEngine(kwargs.get("model_name"))
         elif engine_name == "elevenlabs":
