@@ -5,3 +5,6 @@ librosa
 matplotlib
 transformers
 numpy
+ipython
+vosk
+pyttsx3
