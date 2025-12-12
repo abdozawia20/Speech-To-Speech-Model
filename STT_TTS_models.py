@@ -1,5 +1,6 @@
 import os
 import subprocess
+import io
 from IPython.display import Audio, display
 import soundfile as sf
 import getpass
@@ -12,6 +13,8 @@ import tarfile
 import platform
 import zipfile
 import json
+from faster_whisper import WhisperModel
+import vosk
 
 # AMD Fix: Force MKL to use AVX2 on AMD CPUs for better performance
 os.environ["MKL_DEBUG_CPU_TYPE"] = "5"
@@ -55,25 +58,47 @@ class TTSBase:
     def run_inference(self, text_input):
         raise NotImplementedError
 
+PIPER_MODEL_SPECS = {}
+PIPER_MODEL_SPECS["en"] = {}
+PIPER_MODEL_SPECS["ar"] = {}
+PIPER_MODEL_SPECS["tr"] = {}
+
+PIPER_MODEL_SPECS["en"]["small"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/small/en_US-lessac-small.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/small/en_US-lessac-small.onnx.json"
+}
+
+PIPER_MODEL_SPECS["en"]["medium"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+}
+
+PIPER_MODEL_SPECS["en"]["high"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high/en_US-lessac-high.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high/en_US-lessac-high.onnx.json"
+}
+
+PIPER_MODEL_SPECS["ar"]["small"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/ar/ar_JO/kareem/low/ar_JO-kareem-low.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/ar/ar_JO/kareem/low/ar_JO-kareem-low.onnx.json"
+}
+
+PIPER_MODEL_SPECS["ar"]["medium"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx.json"
+}
+
+PIPER_MODEL_SPECS["tr"]["medium"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
+}
+
 class PiperEngine(TTSBase):
     # Define available voice models (name -> {onnx_url, json_url})
-    VOICE_MODELS = {
-        "en_US-lessac-medium": {
-            "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
-            "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
-        },
-        "en_US-lessac-high": {
-            "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high/en_US-lessac-high.onnx",
-            "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/high/en_US-lessac-high.onnx.json"
-        },
-         "en_US-libritts-high": {
-            "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts/high/en_US-libritts-high.onnx",
-            "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/libritts/high/en_US-libritts-high.onnx.json"
-        }
-    }
 
-    def __init__(self, model_name="en_US-lessac-medium"):
-        self.current_model_name = None
+    def __init__(self, model_size="small", model_language="en"):
+        self.current_model_size = None
+        self.current_model_language = None
         self.piper_binary = None
         self.piper_url = None
         
@@ -105,27 +130,27 @@ class PiperEngine(TTSBase):
             except Exception as e:
                 print(f"Error downloading/extracting Piper: {e}")
 
-        self.load_model(model_name)
+        self.load_model(model_size, model_language)
 
-    def load_model(self, model_name):
-        if model_name == self.current_model_name:
-            print(f"Model '{model_name}' is already loaded.")
+    def load_model(self, model_size, model_language):
+        if model_size == self.current_model_size and model_language == self.current_model_language:
+            print(f"Model '{model_language}':'{model_size}' is already loaded.")
             return
 
-        if model_name not in self.VOICE_MODELS:
-            print(f"Warning: Model '{model_name}' not found in VOICE_MODELS. Using default 'en_US-lessac-medium'.")
-            model_name = "en_US-lessac-medium"
+        if model_size not in PIPER_MODEL_SPECS[model_language]:
+            print(f"Warning: Model '{model_language}':'{model_size}' not found in MODEL_SPECS. Using default 'medium'.")
+            model_size = "medium"
 
-        print(f"Loading voice model: {model_name}...")
-        model_info = self.VOICE_MODELS[model_name]
+        print(f"Loading voice model: {model_size}...")
+        model_info = PIPER_MODEL_SPECS[model_language][model_size]
         
         # Define file names 
-        onnx_filename = f"{model_name}.onnx"
-        json_filename = f"{model_name}.onnx.json"
+        onnx_filename = f"piper_{model_language}_{model_size}.onnx"
+        json_filename = f"piper_{model_language}_{model_size}.onnx.json"
 
         # Check if files already exist
         if not os.path.exists(onnx_filename) or not os.path.exists(json_filename): 
-            print(f"Downloading {model_name}...")
+            print(f"Downloading {model_info['onnx']}...")
             try:
                 urllib.request.urlretrieve(model_info["onnx"], onnx_filename)
                 urllib.request.urlretrieve(model_info["json"], json_filename)
@@ -133,11 +158,11 @@ class PiperEngine(TTSBase):
                 print(f"Error downloading voice model: {e}")
                 return
         else:
-             print(f"Model files for {model_name} already exist.")
+             print(f"Model files for {model_info['onnx']} already exist.")
 
-        self.current_model_name = model_name
+        self.current_model_name = model_info['onnx']
         self.current_onnx_path = onnx_filename
-        print(f"Voice model '{model_name}' ready.")
+        print(f"Voice model '{model_info['onnx']}' ready.")
         
 
     def validate(self):
@@ -166,17 +191,34 @@ class PiperEngine(TTSBase):
              print("Error: No voice model loaded.")
              return None
 
-        cmd = f'echo "{text_input}" | "{self.piper_binary}" --model {self.current_onnx_path} --output_file output.wav'
+        cmd = [self.piper_binary, "--model", self.current_onnx_path, "--output_file", "-"]
+        
         try:
-           # Windows Popen fix for pipes
-           if self.system == "Windows":
-               subprocess.run(cmd, shell=True, check=True)
-           else:
-               subprocess.run(cmd, shell=True, check=True)
+           # Use subprocess.run to pipe input and capture output directly
+           result = subprocess.run(
+               cmd,
+               input=text_input.encode('utf-8'),
+               capture_output=True,
+               check=True
+           )
            
-           return "output.wav"
+           # Read from memory
+           with io.BytesIO(result.stdout) as wav_io:
+               data, samplerate = sf.read(wav_io)
+               
+           return {
+               'audio': {
+                   'array': data,
+                   'sampling_rate': samplerate
+               }
+           }
         except subprocess.CalledProcessError as e:
             print(f"Error running Piper: {e}")
+            if e.stderr:
+                print(f"Stderr: {e.stderr.decode()}")
+            return None
+        except Exception as e:
+            print(f"Error processing audio output: {e}")
             return None
 
 class SystemEngine(TTSBase):
@@ -252,34 +294,28 @@ class TTSEngine():
     Facade for switching between TTS engines.
     Engines: 'piper', 'system', 'elevenlabs', 'openai'
     """
-    def __init__(self, engine="piper", **kwargs):
+    def __init__(self, engine="piper", model_size="small", language="en"):
         self.engine = None
         self.current_engine_name = None
-        self.load_engine(engine, **kwargs)
 
-    def load_engine(self, engine_name, **kwargs):
-        engine_name = engine_name.lower()
-        print(f"Switching TTS Engine to: {engine_name}...")
+        engine = engine.lower()
+        print(f"Switching TTS Engine to: {engine}...")
         
-        if engine_name == "piper":
-            model_size = kwargs.get("model_size", "small")
-            self.engine = PiperEngine(f"en_US-lessac-{model_size}")
-        elif engine_name == "system":
-            self.engine = SystemEngine(kwargs.get("model_name"))
-        elif engine_name == "elevenlabs":
-            self.engine = ElevenLabsEngine(kwargs.get("api_key"))
-        elif engine_name == "openai":
-            self.engine = OpenAIEngine(kwargs.get("api_key"))
+        if engine == "piper":
+            self.engine = PiperEngine(model_size, language)
+        elif engine == "system":
+            self.engine = SystemEngine(model_name)
+        elif engine == "elevenlabs":
+            # self.engine = ElevenLabsEngine(api_key)
+            raise NotImplementedError
+        elif engine == "openai":
+            # self.engine = OpenAIEngine(api_key)
+            raise NotImplementedError
         else:
-            print(f"Unknown engine '{engine_name}'. Defaulting to Piper.")
-            self.engine = PiperEngine()
-            engine_name = "piper"
+            print(f"WARNING: Engine settings not found for '{engine}:{model_size}-{language}'. Defaulting to Piper:en-small.")
+            self.__init__(engine="piper", model_size="small", language="en")
         
-        self.current_engine_name = engine_name
-
-    def load_model(self, model_name):
-        if self.engine:
-            self.engine.load_model(model_name)
+        self.current_engine_name = engine
 
     def run_inference(self, text_input):
         if self.engine:
@@ -296,12 +332,25 @@ class STTBase:
         raise NotImplementedError
 
 class WhisperEngine(STTBase):
-    def __init__(self, model_size="small"):
+    """
+    Whisper STT Engine
+    This engine uses OpenAI's Whisper for speech-to-text transcription. 
+    This model is used only for comparing the performance of the main model.
+    External Documentation: https://github.com/openai/whisper
+
+    Supported Models (languages are autodetected based on the audio):
+    - small
+    - medium
+    - large
+
+    """
+
+
+    def __init__(self, model_size, language):
         self.model = None
-        self.load_model(model_size)
+        self.language = language
 
     def load_model(self, model_size):
-        from faster_whisper import WhisperModel # Lazy import
 
         if torch.cuda.is_available():
             device = "cuda"
@@ -340,7 +389,7 @@ class WhisperEngine(STTBase):
             segments, info = self.model.transcribe(
                 audio_array,
                 beam_size=5,
-                language=None
+                language=self.language
             )
 
             print("Detected language:", info.language)
@@ -358,49 +407,67 @@ class WhisperEngine(STTBase):
             print(f"Error during transcription: {e}")
             return ""
 
+VOSK_MODEL_SPECS = {}
+VOSK_MODEL_SPECS["en"] = {}
+VOSK_MODEL_SPECS["ar"] = {}
+VOSK_MODEL_SPECS["tr"] = {}
+
+VOSK_MODEL_SPECS["en"]["small"] = "vosk-model-small-en-us-0.15"
+VOSK_MODEL_SPECS["en"]["large"] = "vosk-model-en-us-0.22"
+
+VOSK_MODEL_SPECS["ar"]["small"] = "vosk-model-ar-mgb2-0.4"
+VOSK_MODEL_SPECS["ar"]["large"] = "vosk-model-ar-0.22-linto-1.1.0"
+
+VOSK_MODEL_SPECS["tr"]["small"] = "vosk-model-small-tr-0.3"
+
 class VoskEngine(STTBase):
-    def __init__(self, model_name="vosk-model-small-en-us-0.15"):
+    """
+    Vosk STT Engine
+    This engine uses Vosk for speech-to-text transcription. 
+    This model is used only for comparing the performance of the main model.
+    External Documentation: https://alphacephei.com/vosk/models
+    
+    Current supported models:
+    en: small, large
+    ar: small, large
+    tr: small
+    """
+    
+    def __init__(self, model_size, language):
         self.model = None
-        self.rec = None
-        self.load_model(model_name)
+        self.load_model(model_size, language)
 
-    def load_model(self, model_name):
-        import vosk # Lazy import
-
-        model_path = model_name
-        # Simple auto-download for the specific small English model
+    def load_model(self, model_size, language):
+        model_path = VOSK_MODEL_SPECS[language][model_size]
+        # Simple auto-download
         if not os.path.exists(model_path):
-            print(f"Vosk model '{model_name}' not found.")
-            if model_name == "vosk-model-small-en-us-0.15":
-                url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-                print(f"Downloading {model_name} from {url}...")
-                zip_name = f"{model_name}.zip"
-                try:
-                    urllib.request.urlretrieve(url, zip_name)
-                    print("Extracting model...")
-                    with zipfile.ZipFile(zip_name, 'r') as zip_ref:
-                        zip_ref.extractall()
-                    # Determine extraction folder name (sometimes it extracts to a folder inside)
-                    # For this zip, it extracts to "vosk-model-small-en-us-0.15"
-                except Exception as e:
-                    print(f"Error downloading vosk model: {e}")
-                    return
+            print(f"Vosk model '{model_path}' not found, attempting to download...")
+            url = f"https://alphacephei.com/vosk/models/{model_path}.zip"
+            print(f"Downloading {model_path} from {url}...")
+            zip_name = f"{model_path}.zip"
+            try:
+                urllib.request.urlretrieve(url, zip_name)
+                print("Extracting model...")
+                with zipfile.ZipFile(zip_name, 'r') as zip_ref:
+                    zip_ref.extractall()
+                # Determine extraction folder name (sometimes it extracts to a folder inside)
+                # For this zip, it extracts to "vosk-model-small-en-us-0.15"
+            except Exception as e:
+                print(f"Error downloading vosk model: {e}")
+                return vosk.Model(model_path)
 
         if os.path.exists(model_path):
-            print(f"Loading Vosk model '{model_name}'...")
+            print(f"Loading Vosk model '{model_path}'...")
             vosk.SetLogLevel(-1) # Silence generic logs
             self.model = vosk.Model(model_path)
-            # KaldiRecognizer doesn't need init here per se, but useful to have
+            return self.model
         else:
-            print(f"Error: Vosk model path '{model_path}' does not exist.")
-            return None
-            
-        return self.model
+            raise FileNotFoundError(f"Error: Vosk model path '{model_path}' does not exist.")
+        
 
     def transcribe(self, audio_array, sample_rate):
-        import vosk # Lazy import
         if self.model is None:
-            return "Error: Vosk model not loaded."
+            raise ValueError("Vosk model not loaded.")
 
         # Vosk expects 16kHz PCM 16-bit mono
         if sample_rate != 16000:
@@ -437,32 +504,29 @@ class STTEngine():
     Facade for swtiching between STT engines.
     Engines: 'whisper', 'vosk', 'google', 'assemblyai'
     """
-    def __init__(self, engine="whisper", **kwargs):
-        self.engine = None
-        self.current_engine_name = None
-        self.load_engine(engine, **kwargs)
+    def __init__(self, engine="whisper", language="en", model_size="small"):
+        self.engine_name = engine
+        self.language = language
+        self.model_size = model_size
 
-    def load_engine(self, engine_name, **kwargs):
-        engine_name = engine_name.lower()
-        print(f"Switching STT Engine to: {engine_name}...")
+        engine = engine.lower()
+        print(f"Switching STT Engine to: {engine} in the ({self.language}) language...")
         
-        if engine_name == "whisper":
-            model_size = kwargs.get("model_size", "small")
-            self.engine = WhisperEngine(model_size)
-        elif engine_name == "vosk":
-            model_size = kwargs.get("model_size", "small")
-            self.engine = VoskEngine(f"vosk-model-{model_size}-en-us-0.15")
-        elif engine_name == "google":
-            self.engine = GoogleEngine()
-        elif engine_name == "assemblyai":
-            self.engine = AssemblyAIEngine()
+        if engine == "whisper":
+            self.engine = WhisperEngine(model_size=self.model_size, language=self.language)
+            self.engine.load_model(model_size=self.model_size)
+        elif engine == "vosk":
+            self.engine = VoskEngine(model_size=self.model_size, language=self.language)
+            self.engine.load_model(model_size=self.model_size, language=self.language)
+        elif engine == "google":
+            # self.engine = GoogleEngine()
+            raise NotImplementedError
+        elif engine == "assemblyai":
+            # self.engine = AssemblyAIEngine()
+            raise NotImplementedError
         else:
-            print(f"Unknown engine '{engine_name}'. Defaulting to Whisper.")
-            self.engine = WhisperEngine()
-            engine_name = "whisper"
-        
-        self.current_engine_name = engine_name
-        return self.engine.load_model(model_size)
+            print(f"WARNING: Engine settings not found for '{engine}:{model_size}-{language}'. Defaulting to Whisper:en-small.")
+            self.__init__(engine="whisper", language="en", model_size="small")
 
     def transcribe(self, audio_array, sample_rate):
         if self.engine:
