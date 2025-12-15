@@ -8,3 +8,5 @@ numpy
 ipython
 vosk
 pyttsx3
+sentencepiece
+soundfile

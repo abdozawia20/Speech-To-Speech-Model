@@ -63,7 +63,8 @@ def load_train_data():
     )
 
     # Combine datasets for each language
-    combined_en = concatenate_datasets([fleurs_en_transformed, voxpopuli_en_transformed])
+    # combined_en = concatenate_datasets([fleurs_en_transformed, voxpopuli_en_transformed])
+    combined_en = fleurs_en_transformed
     combined_ar = concatenate_datasets([fleurs_ar_transformed])
     combined_tr = concatenate_datasets([fleurs_tr_transformed])
 
