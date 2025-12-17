@@ -10,3 +10,7 @@ vosk
 pyttsx3
 sentencepiece
 soundfile
+evaluate
+sacrebleu
+rouge_score
+unbabel-comet
