@@ -1,4 +1,7 @@
 import os
+# Disable symlinks warning on Windows for Hugging Face Hub
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import torch
 import numpy as np
 import librosa
@@ -123,14 +126,14 @@ def analyze():
         
         # Initialize Engines for this language pair
         # Step 1: STT (Language A) - mostly for completeness/logging
-        stt_A = STTEngine(engine="whisper", language=src_lang, model_size="small")
+        stt_A = STTEngine(engine="whisper", language=src_lang, model_size="large")
         
         # Step 2: TTS (Language B)
         # Piper specs in STT_TTS_models.py: en, ar, tr supported.
-        tts_B = TTSEngine(engine="piper", language=tgt_lang, model_size="small") # or medium
+        tts_B = TTSEngine(engine="piper", language=tgt_lang, model_size="high") # or medium
 
         # Step 3: STT (Language B) - Verifier
-        stt_B_Verifier = STTEngine(engine="whisper", language=tgt_lang, model_size="small")
+        stt_B_Verifier = STTEngine(engine="whisper", language=tgt_lang, model_size="large")
 
         tgt_refs = []
         tgt_preds = []
