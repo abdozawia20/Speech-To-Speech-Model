@@ -13,7 +13,7 @@ def transform_voxpopuli_internal(batch):
     batch['language'] = str(batch['language'])
     return batch
 
-def load_train_data():
+def load_train_data(start_idx=0, num_samples=10000):
     # Define columns to keep in the final harmonized schema
     columns_to_keep = ['id', 'audio', 'transcription', 'language', 'gender']
 
@@ -21,12 +21,12 @@ def load_train_data():
     config = DownloadConfig(resume_download=True, max_retries=10)
 
     # Dataset 1: Fleurs
-    fleurs_en = load_dataset("google/fleurs", "en_us", split="train", trust_remote_code=True, streaming=True, download_config=config)
-    fleurs_ar = load_dataset("google/fleurs", "ar_eg", split="train", trust_remote_code=True, streaming=True, download_config=config)
-    fleurs_tr = load_dataset("google/fleurs", "tr_tr", split="train", trust_remote_code=True, streaming=True, download_config=config)
+    fleurs_en = load_dataset("google/fleurs", "en_us", split=f"train[{start_idx}:{start_idx+num_samples}]", trust_remote_code=True, download_config=config)
+    fleurs_ar = load_dataset("google/fleurs", "ar_eg", split=f"train[{start_idx}:{start_idx+num_samples}]", trust_remote_code=True, download_config=config)
+    fleurs_tr = load_dataset("google/fleurs", "tr_tr", split=f"train[{start_idx}:{start_idx+num_samples}]", trust_remote_code=True, download_config=config)
 
     # Dataset 2: Voxpopuli (Only Supports English)
-    voxpopuli_en = load_dataset("facebook/voxpopuli", "en", split="train", trust_remote_code=True, streaming=True, download_config=config)
+    voxpopuli_en = load_dataset("facebook/voxpopuli", "en", split=f"train[{start_idx}:{start_idx+num_samples}]", trust_remote_code=True, download_config=config)
 
     # ******************************ENGLISH TRANSFORMATIONS******************************
 
