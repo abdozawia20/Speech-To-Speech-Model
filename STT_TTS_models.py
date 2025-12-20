@@ -64,8 +64,8 @@ PIPER_MODEL_SPECS["ar"] = {}
 PIPER_MODEL_SPECS["tr"] = {}
 
 PIPER_MODEL_SPECS["en"]["small"] = {
-    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx",
-    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx.json"
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/small/en_US-lessac-small.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/small/en_US-lessac-small.onnx.json"
 }
 
 PIPER_MODEL_SPECS["en"]["medium"] = {
@@ -101,7 +101,6 @@ class PiperEngine(TTSBase):
         self.current_model_language = None
         self.piper_binary = None
         self.piper_url = None
-        self.current_onnx_path = None
         
         # OS Detection
         self.system = platform.system()
