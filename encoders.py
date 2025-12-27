@@ -4,23 +4,40 @@ import librosa
 import numpy as np
 from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor
 
-class SpectogramEncoder:
-    def __init__(self):
-        pass
+class SpectrogramEncoder:
+    def __init__(self, sample_rate=16000, n_mels=80, n_fft=1024, hop_length=256):
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
 
-    def encode(self, audio_array, sampling_rate):
-        # Compute the Short-Time Fourier Transform (STFT)
-        D = librosa.stft(audio_array)
-        # Convert amplitude spectrogram to dB-scaled spectrogram
-        S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+    def encode(self, audio_array, sr=None):
+        if sr is None:
+            sr = self.sample_rate
+
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio_array,
+            sr=sr,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels
+        )
+
+        S_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
         return S_db
 
-    def decode(self, S_db, sampling_rate, n_iter=32):
-        # Convert dB-scaled spectrogram back to amplitude
-        S = librosa.db_to_amplitude(S_db)
-        # Reconstruct time-domain signal using Griffin-Lim
-        # Griffin-Lim estimates phase to reconstruct audio from magnitude spectrogram
-        audio_reconstructed = librosa.griffinlim(S, n_iter=n_iter)
+    def decode(self, S_db, n_iter=32):
+        S_power = librosa.db_to_power(S_db)
+
+        audio_reconstructed = librosa.feature.inverse.mel_to_audio(
+            S_power,
+            sr=self.sample_rate,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_iter=n_iter
+        )
+        
         return audio_reconstructed
 
 class Wav2VecEncoder(nn.Module):

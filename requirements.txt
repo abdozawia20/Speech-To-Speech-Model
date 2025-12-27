@@ -11,3 +11,4 @@ pyttsx3
 sentencepiece
 soundfile
 hf_xet
+gTTS
