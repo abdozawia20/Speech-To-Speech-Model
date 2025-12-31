@@ -12,3 +12,4 @@ sentencepiece
 soundfile
 hf_xet
 gTTS
+peft

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import librosa
 import numpy as np
-from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor
+from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor, SpeechT5Processor
 
 class SpectrogramEncoder:
     def __init__(self, sample_rate=16000, n_mels=80, n_fft=1024, hop_length=256):
@@ -97,3 +97,13 @@ class VQGANEncoder(nn.Module):
         # We generally don't need scales for simple reconstruction in recent versions,
         # but the model expects the argument structure.
         return self.model.decode(audio_codes, audio_scales)[0]
+
+class SpeechT5Encoder(nn.Module):
+    def __init__(self, model_name="microsoft/speecht5_tts"):
+        super(SpeechT5Encoder, self).__init__()
+        # SpeechT5Processor handles the log-mel spectrogram extraction
+        self.processor = SpeechT5Processor.from_pretrained(model_name)
+        
+    def encode(self, audio_array, sr=16000):
+        inputs = self.processor(audio=audio_array, sampling_rate=sr)
+        return inputs.input_values
