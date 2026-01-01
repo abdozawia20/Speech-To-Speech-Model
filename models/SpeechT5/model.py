@@ -1,7 +1,10 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import torchaudio
 import numpy as np
 from transformers import SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan
-from datasets import load_from_disk
+from datasets import load_from_disk, load_dataset
 import dataset_loader
 import librosa
 import sys
@@ -9,91 +12,21 @@ import json
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-class SpeechT5(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Load the pretrained components
-        print("Loading SpeechT5 components...")
-        self.processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_vc")
-        self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
-        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
-        
-        # Determine device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
-        # Move models to device
-        self.model.to(self.device)
-        self.vocoder.to(self.device)
-
-        # Set to eval mode by default
-        self.model.eval()
-        self.vocoder.eval()
-        print("Model loaded successfully.")
-
-    # ... (predict method stays same) ...
-
-    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate):
-        """
-        Fine-tunes the SpeechT5 model using LoRA.
-        """
-        print(f"Starting LoRA fine-tuning: {source_lang} -> {target_lang}")
-        
-        # ... (Data Loading Logic stays same until model setup) ...
-        # (Assuming the loading logic is correct and working)
-        
-        # ... [Data Loading Code Block handled in other chunks if needed, but context shows we are replacing file content to inject LoRA] ...
-        # Actually, replace_file_content replaces a single block. I will use multi_replace for safety or target the specific block properly.
-        # But wait, I need to add imports at the top.
-        # And I need to change the `fine_tune` method implementation heavily around line 179.
-        
-        pass 
-
-SPEECHT5_N_FFT = 1024
-SPEECHT5_HOP_LENGTH = 160  # 10ms at 16k
-SPEECHT5_WIN_LENGTH = 400  # 25ms at 16k
-SPEECHT5_N_MELS = 80
-SPEECHT5_SAMPLING_RATE = 16000
-
-def get_log_mel_spectrogram(audio_array):
-    """
-    Computes Log-Mel Spectrogram matching SpeechT5 requirements.
-    Args:
-        audio_array (np.array): Raw audio waveform (16kHz).
-    Returns:
-        np.array: (Time, 80) log-mel spectrogram.
-    """
-    # Ensure numpy
-    if isinstance(audio_array, torch.Tensor):
-        audio_array = audio_array.cpu().numpy()
-        
-    mel_spec = librosa.feature.melspectrogram(
-        y=audio_array, 
-        sr=SPEECHT5_SAMPLING_RATE, 
-        n_fft=SPEECHT5_N_FFT, 
-        hop_length=SPEECHT5_HOP_LENGTH, 
-        win_length=SPEECHT5_WIN_LENGTH, 
-        n_mels=SPEECHT5_N_MELS,
-        fmin=80,
-        fmax=7600,
-        power=1.0 # Energy (unclear if SpeechT5 uses power 1 or 2, Wav2Vec is usually power 2? No, Tacotron 1.0. Default librosa is 2.0)
-        # SpeechT5 uses Kaldi-style filterbanks usually. 
-        # But we will use power=2.0 (standard mel) then log.
-    )
-    
-    # Log magnitude (log10(x + 1e-6))
-    log_mel_spec = np.log10(mel_spec + 1e-6)
-    
-    # Transpose to (Time, Channels)
-    return log_mel_spec.T.astype(np.float32)
 import os
+import gc
 
+# Monkey-patch torchaudio for SpeechBrain compatibility
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+from speechbrain.inference.speaker import EncoderClassifier
 
 class SpeechT5Dataset(Dataset):
-    def __init__(self, source_ds, target_ds, is_preprocessed=True):
+    def __init__(self, source_ds, target_ds, processor, speaker_embeddings, is_preprocessed=True):
         self.source_ds = source_ds
         self.target_ds = target_ds
+        self.processor = processor
+        self.speaker_embeddings = speaker_embeddings
         self.is_preprocessed = is_preprocessed
 
     def __len__(self):
@@ -103,349 +36,364 @@ class SpeechT5Dataset(Dataset):
         src_item = self.source_ds[int(idx)]
         tgt_item = self.target_ds[int(idx)]
 
-        # Handle Source
-        src_val = src_item['audio']
-        if isinstance(src_val, dict) and 'array' in src_val:
-            src_val = src_val['array']
-        src_val = np.array(src_val)
+        # Helper to extract array from dataset item
+        def get_val(item):
+            val = item['audio']
+            if isinstance(val, dict) and 'array' in val:
+                return val['array']
+            return val
 
-        # Handle Target
-        tgt_val = tgt_item['audio']
-        if isinstance(tgt_val, dict) and 'array' in tgt_val:
-            tgt_val = tgt_val['array']
-        tgt_val = np.array(tgt_val)
+        # 1. Load Data
+        src_val = np.array(get_val(src_item), dtype=np.float32)
+        tgt_val = np.array(get_val(tgt_item), dtype=np.float32)
 
-        # Apply preprocessing if not already done
-        if len(tgt_val.shape) == 1:
-             tgt_val = get_log_mel_spectrogram(tgt_val)
+        # 2. Fast Path: Preprocessed Data
+        # We need to be careful. Even if is_preprocessed=True, the disk data might be raw audio 
+        # if the preprocessing script saved it that way or if it's mixed.
+        target_features = None
+        source_features = None
 
-        MAX_AUDIO_LEN = int(5.0 * 16000)
-        MAX_SPEC_LEN = int(5.0 * (16000 / SPEECHT5_HOP_LENGTH)) 
-        
-        if len(src_val.shape) == 1 and len(src_val) > MAX_AUDIO_LEN:
-                src_val = src_val[:MAX_AUDIO_LEN]
-        
-        if len(tgt_val.shape) > 1 and len(tgt_val) > MAX_SPEC_LEN:
-            tgt_val = tgt_val[:MAX_SPEC_LEN, :]
+        if self.is_preprocessed:
+            # Source: Always raw audio (normalized or not)
+            if src_val.ndim > 1: src_val = src_val.flatten()
+            source_features = torch.tensor(src_val)
+
+            # Target: Should be Spectrogram (Time, 80)
+            # CHECK: Is it actually a spectrogram?
+            # Case A: Already 2D
+            if tgt_val.ndim == 2:
+                target_features = torch.tensor(tgt_val)
+            # Case B: Flattened Spectrogram (Divisible by 80)
+            elif tgt_val.ndim == 1 and tgt_val.size > 80 and tgt_val.size % 80 == 0:
+                # Heuristic: If it divides by 80, it's likely a flattened spec.
+                target_features = torch.tensor(tgt_val).view(-1, 80)
+            # Case C: 3D (1, Time, 80)
+            elif tgt_val.ndim == 3:
+                target_features = torch.tensor(tgt_val).squeeze()
+            
+            # If target_features is set, check if it makes sense (Time > 0)
+            if target_features is not None:
+                 if target_features.shape[-1] != 80:
+                      # If last dim is not 80, our assumption was wrong (e.g. it was raw audio divisible by 80)
+                      # Discard and fallback
+                      target_features = None
+
+        # 3. Fallback: Raw Audio Processing (Slow Path)
+        if target_features is None:
+            if src_val.ndim > 1: src_val = src_val.flatten()
+            if tgt_val.ndim > 1: tgt_val = tgt_val.flatten()
+
+            source_features = torch.tensor(src_val, dtype=torch.float32)
+
+            # Generate Target Spectrogram
+            try:
+                # Force feature extractor
+                features = self.processor.feature_extractor(
+                    tgt_val, 
+                    sampling_rate=16000, 
+                    return_tensors="pt"
+                ).input_values[0]
+                
+                # Validation: Did it return raw audio?
+                if features.dim() == 1 and len(features) == len(tgt_val):
+                     raise ValueError("Processor returned raw audio")
+                
+                target_features = features
+            except:
+                # Librosa fallback
+                mel = librosa.feature.melspectrogram(y=tgt_val, sr=16000, n_fft=1024, hop_length=256, n_mels=80)
+                log_mel = librosa.power_to_db(mel, ref=np.max)
+                norm_mel = (log_mel + 40.0) / 20.0 
+                target_features = torch.tensor(norm_mel.T, dtype=torch.float32)
+
+        # 4. Final Shape Validations
+        # Ensure (Time, 80)
+        if target_features.dim() == 2:
+             if target_features.shape[0] == 80 and target_features.shape[1] != 80:
+                  target_features = target_features.transpose(0, 1)
+        elif target_features.dim() == 1:
+             # Last ditch effort for 1D tensors that slipped through
+             if target_features.shape[0] % 80 == 0:
+                  target_features = target_features.view(-1, 80)
+             else:
+                  # Recalculate using librosa if we have the original val
+                  mel = librosa.feature.melspectrogram(y=tgt_val, sr=16000, n_fft=1024, hop_length=256, n_mels=80)
+                  log_mel = librosa.power_to_db(mel, ref=np.max)
+                  norm_mel = (log_mel + 40.0) / 20.0 
+                  target_features = torch.tensor(norm_mel.T, dtype=torch.float32)
 
         return {
-            "input_values": torch.tensor(src_val, dtype=torch.float32),
-            "labels": torch.tensor(tgt_val, dtype=torch.float32)
+            "input_values": source_features,
+            "labels": target_features,
+            "speaker_embeddings": self.speaker_embeddings
         }
 
 def speecht5_collate_fn(batch):
     input_values = [item["input_values"] for item in batch]
     labels = [item["labels"] for item in batch]
+    speaker_embeddings = [item["speaker_embeddings"] for item in batch]
     
     input_values_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True)
     labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
+    speaker_embeddings_stacked = torch.stack(speaker_embeddings)
     
-    return input_values_padded, labels_padded
+    attention_mask = (input_values_padded != 0).long()
+    
+    return input_values_padded, attention_mask, labels_padded, speaker_embeddings_stacked
 
 class SpeechT5(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        # Load the pretrained components
         print("Loading SpeechT5 components...")
         self.processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_vc")
         self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
         self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
         
-        # Determine device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Move models to device
         self.model.to(self.device)
         self.vocoder.to(self.device)
+        self.target_embeddings = None
 
-        # Set to eval mode as we are just running the baseline
-        self.model.eval()
-        self.vocoder.eval()
-        print("Model loaded successfully.")
-
-    def predict(self, audio_array, sampling_rate):
+    def get_speaker_embedding(self, target_lang):
         """
-        Runs the SpeechT5 baseline for speech-to-speech conversion.
+        Smart embedding extractor. 
+        If data is preprocessed, it streams ONE raw sample from HF to get the voice.
+        """
+        print("Initializing X-Vector classifier for embedding extraction...")
+        # Load locally to avoid constant HF fetching if possible
+        spk_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-xvect-voxceleb", 
+            savedir="tmp_spkrec", 
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+        )
         
-        Args:
-            audio_array (np.array): Input audio waveform.
-            sampling_rate (int): Sampling rate of the input audio.
+        print("Extracting target speaker embedding...")
+        try:
+            print(f"Streaming 1 sample from seamless-align-expressive for {target_lang}...")
             
-        Returns:
-            np.array: The resulting audio waveform.
-        """
-        # Prepare the input
-        # The processor handles resampling and feature extraction if needed, 
-        # but SpeechT5Processor for VC usually expects audio input.
-        inputs = self.processor(audio=audio_array, sampling_rate=sampling_rate, return_tensors="pt")
+            subset = "deA-enA" 
+            
+            ds_stream = load_dataset(
+                "jhu-clsp/seamless-align-expressive", 
+                subset, # Using specific subset
+                streaming=True, 
+                trust_remote_code=True,
+                split="train"
+            )
+            
+            tgt_waveform = None
+            
+            # Iterate a few samples to find valid audio
+            for sample in ds_stream:
+                if 'src_audio' in sample:
+                    arr = sample['src_audio']['array']
+                    if len(arr) > 0:
+                        tgt_waveform = torch.tensor(arr).unsqueeze(0).to(spk_classifier.device)
+                        break
+            
+            if tgt_waveform is None:
+                raise ValueError("Could not find target audio in stream.")
+
+            with torch.no_grad():
+                embeddings = spk_classifier.encode_batch(tgt_waveform)
+                self.target_embeddings = torch.nn.functional.normalize(embeddings, dim=2).squeeze().cpu()
+            print("Embedding extracted successfully.")
+
+        except Exception as e:
+            print(f"Warning: Could not stream raw audio for embedding ({e}). Using random embedding.")
+            self.target_embeddings = torch.randn(512)
+
+        # VRAM CLEANUP
+        print("Cleaning up speaker classifier to free VRAM...")
+        del spk_classifier
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    def run_inference(self, audio_array, sampling_rate, speaker_embedding=None, threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
+        # Limit input duration to avoid positional encoding overflow (model max ~30s output)
+        duration = len(audio_array) / sampling_rate
+        MAX_DURATION = 10.0 
         
-        # Move inputs to device
+        if duration > MAX_DURATION:
+             print(f"Audio truncated to {MAX_DURATION:.2f}s (from {duration:.2f}s) to prevent model overflow.")
+             max_samples = int(MAX_DURATION * sampling_rate)
+             audio_array = audio_array[:max_samples]
+
+        inputs = self.processor(audio=audio_array, sampling_rate=sampling_rate, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        # Check if input has 'input_values' or 'input_features' depending on processor specifics
-        # The SpeechT5Processor usually returns input_values for audio
-        
-        # Generate dummy speaker embedding (1, 512)
-        # SpeechT5 requires speaker embeddings for generating speech
-        speaker_embeddings = torch.randn((1, 512)).to(self.device)
+        if speaker_embedding is not None:
+            emb = torch.tensor(speaker_embedding).to(self.device).unsqueeze(0)
+        elif self.target_embeddings is not None:
+            emb = self.target_embeddings.to(self.device).unsqueeze(0)
+        else:
+            emb = torch.randn((1, 512)).to(self.device)
 
-        # Generate speech
-        # We pass the input_values from the processor
         with torch.no_grad():
             speech = self.model.generate_speech(
                 inputs["input_values"], 
-                speaker_embeddings, 
-                vocoder=self.vocoder
+                emb, 
+                vocoder=self.vocoder, 
+                threshold=threshold,
+                minlenratio=minlenratio,
+                maxlenratio=maxlenratio
             )
 
-        return speech.cpu().numpy()
+        return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
-    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate, resume_from_checkpoint=None):
-        """
-        Fine-tunes the SpeechT5 model.
-
-        Args:
-            source_lang (str): Source language code (e.g., 'en').
-            target_lang (str): Target language code (e.g., 'tr').
-            batch_size (int): Batch size for training.
-            epochs (int): Number of epochs.
-            learning_rate (float): Learning rate.
-        """
+    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate, resume_from_checkpoint=None, use_lora=False):
         print(f"Starting fine-tuning: {source_lang} -> {target_lang}")
         
-        # 1. Load Data
-        print("Loading datasets...")
+        # --- CONFIGURATION ---
+        GRAD_ACCUM_STEPS = 8  # Simulate batch size of 8 (8 * 1 = 8)
         
-        # Construct path for preprocessed data
-        # Mapping de-en etc.
-        # We assume the preprocessing script saved as 'datasets/processed_speecht5_{source}_{target}'
-        # Note: The pair naming in dataset_loader was 'deA-enA'. 
-        # But our manual script used 'datasets/processed_speecht5_de_en'.
-        # Let's check for that specific pattern first.
+        # 1. Load Preprocessed Datasets
+        preprocessed_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}_v2")
         
-        preprocessed_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}")
-        preprocessed_path_rev = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{target_lang}_{source_lang}")
-        
-        source_ds = None
-        target_ds = None
-        is_preprocessed = False
-        
-        # Check both permutations
-        if os.path.exists(preprocessed_path):
-            active_path = preprocessed_path
-        elif os.path.exists(preprocessed_path_rev):
-            active_path = preprocessed_path_rev
+        if not os.path.exists(preprocessed_path):
+            alt_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}")
+            if os.path.exists(alt_path):
+                preprocessed_path = alt_path
+            else:
+                print("Preprocessed dataset not found. Proceeding with raw load (High VRAM warning).")
+                preprocessed_path = None
+
+        if preprocessed_path:
+            print(f"Loading preprocessed data from {preprocessed_path}...")
+            source_ds = load_from_disk(os.path.join(preprocessed_path, source_lang))
+            target_ds = load_from_disk(os.path.join(preprocessed_path, target_lang))
+            is_preprocessed_flag = True
         else:
-            active_path = None
+            print("Loading raw data via dataset_loader...")
+            datasets = dataset_loader.load_data(lang=[source_lang, target_lang], split="train", dataset=['seamless_align'])
+            source_ds = datasets.get(source_lang)
+            target_ds = datasets.get(target_lang)
+            is_preprocessed_flag = False
         
-        if active_path:
-            print(f"Found preprocessed data at {active_path}. Loading...")
-            try:
-                source_ds = load_from_disk(os.path.join(active_path, source_lang))
-                target_ds = load_from_disk(os.path.join(active_path, target_lang))
-                is_preprocessed = True
-                print("Successfully loaded preprocessed spectrograms.")
-            except Exception as e:
-                print(f"Failed to load preprocessed data: {e}. Falling back to raw load.")
-        
-        if not is_preprocessed:
-             print("Loading raw data via dataset_loader (On-the-fly processing will be used)...")
-             datasets = dataset_loader.load_data(
-                lang=[source_lang, target_lang], 
-                split="train",
-                dataset=['seamless_align'] # Explicitly request Seamless Align
-             )
-             source_ds = datasets.get(source_lang)
-             target_ds = datasets.get(target_lang)
+        # 2. Get Embedding (Raw Audio Required)
+        if self.target_embeddings is None:
+            self.get_speaker_embedding(target_lang)
 
-        if not source_ds or not target_ds:
-            raise ValueError(f"Could not load datasets for {source_lang} and {target_lang}")
-        
-        # Ensure lengths match
-        min_len = min(len(source_ds), len(target_ds))
-        if len(source_ds) != len(target_ds):
-            print(f"Warning: Dataset lengths differ ({len(source_ds)} vs {len(target_ds)}). Truncating to {min_len}.")
-            # We must truncate to ensure index alignment matches
-            source_ds = source_ds.select(range(min_len))
-            target_ds = target_ds.select(range(min_len))
-        
-        num_samples = min_len
-
-        # --- LoRA Configuration ---
-        # SpeechT5 is an Encoder-Decoder model. We target the attention layers.
-        # Common targets: "q_proj", "v_proj" (for both encoder and decoder usually)
-        peft_config = LoraConfig(
-            # task_type=TaskType.SEQ_2_SEQ_LM, # Removed: causes AttributeError on SpeechT5
-            inference_mode=False, 
-            r=16, 
-            lora_alpha=32, 
-            lora_dropout=0.1,
-            target_modules=["k_proj", "v_proj", "q_proj", "out_proj"] # Target attention-related projections
-        )
-        
-        # Wrap the model for LoRA
-        self.model = get_peft_model(self.model, peft_config)
-        self.model.print_trainable_parameters()
-        
-        # Handle resume from checkpoint
-        start_epoch = 0
+        # 3. Configure Model
+        if use_lora:
+            print("Enabling LoRA...")
+            peft_config = LoraConfig(inference_mode=False, r=16, lora_alpha=32, lora_dropout=0.1, target_modules=["k_proj", "v_proj", "q_proj", "out_proj"])
+            self.model = get_peft_model(self.model, peft_config)
+            self.model.print_trainable_parameters()
+        else:
+             print("LoRA Disabled. Freezing Feature Encoder.")
+             self.model.freeze_feature_encoder()
+             
         if resume_from_checkpoint:
-            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
-            try:
-                # Load the adapter weights
-                self.model = PeftModel.from_pretrained(self.model, resume_from_checkpoint)
-                # Optionally, load optimizer state and epoch number if saved
-                # For simplicity, we'll just resume training from epoch 0 with loaded weights.
-                # A more robust checkpointing system would save optimizer state and current epoch.
-                print("LoRA adapters loaded successfully from checkpoint.")
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}. Starting training from scratch.")
+            print(f"Resuming from {resume_from_checkpoint}")
+            self.model = PeftModel.from_pretrained(self.model, resume_from_checkpoint)
         
         self.model.train()
-        
-        # Note: Gradient Checkpointing can be enabled with LoRA if needed for extra savings,
-        # but with R=16 LoRA, it might fit without it.
-        # If we enable it, ensure we do: self.model.enable_input_require_grads()
-        # self.model.gradient_checkpointing_enable() 
-        # For now, let's try WITHOUT checkpointing to avoid the "Backward Second Time" headache.
-        # LoRA itself drastically reduces memory for optimizer states.
-        
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         
-        # Simple training loop
-        # num_samples was calculated above
-        
-        try:
-            # Create Dataset and DataLoader
-            # Ensure we pass the possibly truncated datasets
-            train_dataset = SpeechT5Dataset(source_ds, target_ds, is_preprocessed=is_preprocessed)
-            
-            # pinned_memory=True allows faster copy to CUDA
-            # num_workers > 0 enables background data loading
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=batch_size, 
-                shuffle=True, 
-                collate_fn=speecht5_collate_fn,
-                num_workers=4, 
-                pin_memory=True
-            )
+        # Add Scheduler (Cosine Decay to settle the loss)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-            for epoch in range(start_epoch, epochs):
-                print(f"Epoch {epoch + 1}/{epochs}")
+        train_dataset = SpeechT5Dataset(
+            source_ds, 
+            target_ds, 
+            self.processor, 
+            self.target_embeddings, 
+            is_preprocessed=is_preprocessed_flag
+        )
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            collate_fn=speecht5_collate_fn, 
+            num_workers=4, 
+            pin_memory=True
+        )
+
+        try:
+            for epoch in range(epochs):
                 epoch_loss = 0.0
                 num_batches = 0
+                optimizer.zero_grad() # Zero gradients at start of epoch
                 
-                # Progress bar for the batch loop
                 pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
                 
-                for input_values_padded, labels_padded in pbar:
-                    # Move to device
-                    input_values_padded = input_values_padded.to(self.device)
-                    labels_padded = labels_padded.to(self.device)
+                for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
+                    input_values = input_values.to(self.device)
                     
-                    batch_curr_size = input_values_padded.size(0)
-                    speaker_embeddings = torch.randn((batch_curr_size, 512)).to(self.device)
+                    # CRITICAL FIX REVISED: Removed input_values.requires_grad_(True)
+                    # We now use a hook on the encoder output instead.
+                    
+                    attention_mask = attention_mask.to(self.device)
+                    labels = labels.to(self.device)
+                    speaker_embeddings = speaker_embeddings.to(self.device)
 
-                    # Forward
-                    optimizer.zero_grad()
-                    
                     outputs = self.model(
-                        input_values=input_values_padded,
+                        input_values=input_values,
+                        attention_mask=attention_mask, 
                         speaker_embeddings=speaker_embeddings,
-                        labels=labels_padded
+                        labels=labels
                     )
                     
                     loss = outputs.loss
                     if loss is None:
                         pred = outputs.spectrogram
-                        target = labels_padded
-                        if pred.shape != target.shape:
-                            min_len = min(pred.shape[1], target.shape[1])
-                            pred = pred[:, :min_len, :]
-                            target = target[:, :min_len, :]
-                        loss = torch.nn.functional.l1_loss(pred, target)
+                        min_len = min(pred.size(1), labels.size(1))
+                        loss = torch.nn.functional.l1_loss(pred[:, :min_len, :], labels[:, :min_len, :])
 
+                    # Normalize loss for gradient accumulation
+                    loss = loss / GRAD_ACCUM_STEPS
                     loss.backward()
-                    optimizer.step()
                     
-                    epoch_loss += loss.item()
+                    # Update weights only every GRAD_ACCUM_STEPS
+                    if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    
+                    # Track original loss scale for display
+                    current_loss = loss.item() * GRAD_ACCUM_STEPS
+                    epoch_loss += current_loss
                     num_batches += 1
+                    pbar.set_postfix({"loss": f"{current_loss:.4f}"})
                 
-                    # Update progress bar
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                 
-                avg_loss = epoch_loss / num_batches if num_batches > 0 else 0
-                print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
+                scheduler.step()
+                print(f"Epoch {epoch+1} Avg Loss: {epoch_loss/num_batches:.4f}")
+                if (epoch + 1) % 5 == 0: self.save(f"checkpoint_epoch_{epoch+1}")
         
         except KeyboardInterrupt:
-            print("\nInterrupt received! Saving training state...")
-            save_path = f"speecht5_{source_lang}_{target_lang}_interrupted"
-            
-            # Save Adapters
-            self.model.save_pretrained(save_path)
-            
-            # Save Training State
-            state = {
-                "epoch": epoch,
-                "epochs": epochs,
-                "learning_rate": learning_rate,
-                "batch_size": batch_size
-            }
-            with open(os.path.join(save_path, "training_state.json"), "w") as f:
-                json.dump(state, f)
-            print(f"State saved to {save_path}. Resume by passing this path to resume_checkpoint.")
-            sys.exit(0)
-            
-        print("Fine-tuning complete.")
+            print("\nTraining interrupted! Saving current progress to 'speecht5_interrupted'...")
+            self.save("speecht5_interrupted")
+            print("Progress saved. Exiting safely.")
+        except Exception as e:
+            print(f"\nAn error occurred: {e}")
+            print("Saving current progress to 'speecht5_error_mid_train'...")
+            self.save("speecht5_error_mid_train")
+            print("Progress saved. Exiting safely.")
 
-    def save(self, path="./FineTunedSpeechT5"):
-        """Saves the fine-tuned model, processor, and vocoder."""
-        print(f"Saving components to {path}...")
-        os.makedirs(path, exist_ok=True)
-        
-        # Save each component in a subdirectory to avoid file collisions (e.g. config.json)
+    def save(self, path):
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))
         self.vocoder.save_pretrained(os.path.join(path, "vocoder"))
-        print("Saved.")
+        if self.target_embeddings is not None:
+            np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
 
     def load(self, path):
-        """Loads the model, processor, and vocoder from path."""
-        print(f"Loading components from {path}...")
-        
-        # Load from subdirectories
         model_path = os.path.join(path, "model")
-        processor_path = os.path.join(path, "processor")
-        vocoder_path = os.path.join(path, "vocoder")
-        
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model directory not found at {model_path}")
-
-        # Load Processor and Vocoder
-        self.processor = SpeechT5Processor.from_pretrained(processor_path)
-        try:
-             self.vocoder = SpeechT5HifiGan.from_pretrained(vocoder_path)
-        except Exception as e:
-             print(f"Warning: Could not load vocoder from {vocoder_path}: {e}")
-             print("Keeping default/current vocoder.")
-
-        # Load Model (LoRA vs Full)
-        # Check if it's a LoRA adapter
         if os.path.exists(os.path.join(model_path, "adapter_config.json")):
-            print("Detected LoRA adapters. Loading base model + adapters...")
-            # Reload base model just in case (to ensure clean state)
+            print("Loading LoRA model...")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
-            self.model.to(self.device)
-            
-            # Load adapters
             self.model = PeftModel.from_pretrained(self.model, model_path)
         else:
-            print("Detected full model. Loading...")
+            print("Loading base model...")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained(model_path)
-            self.model.to(self.device)
         
+        self.model.to(self.device)
         self.model.eval()
-        self.vocoder.eval()
-        print("Loaded.")
+        
+        # Try load embedding
+        emb_path = os.path.join(path, "speaker_embedding.npy")
+        if os.path.exists(emb_path):
+            self.target_embeddings = torch.tensor(np.load(emb_path))

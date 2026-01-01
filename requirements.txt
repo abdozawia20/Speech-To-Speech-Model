@@ -13,3 +13,4 @@ soundfile
 hf_xet
 gTTS
 peft
+speechbrain
