@@ -62,6 +62,7 @@ PIPER_MODEL_SPECS = {}
 PIPER_MODEL_SPECS["en"] = {}
 PIPER_MODEL_SPECS["ar"] = {}
 PIPER_MODEL_SPECS["tr"] = {}
+PIPER_MODEL_SPECS["de"] = {}
 
 PIPER_MODEL_SPECS["en"]["small"] = {
     "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/small/en_US-lessac-small.onnx",
@@ -91,6 +92,21 @@ PIPER_MODEL_SPECS["ar"]["medium"] = {
 PIPER_MODEL_SPECS["tr"]["medium"] = {
     "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
     "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
+}
+
+PIPER_MODEL_SPECS["de"]["low"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx.json"
+}
+
+PIPER_MODEL_SPECS["de"]["medium"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json"
+}
+
+PIPER_MODEL_SPECS["de"]["high"] = {
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/high/de_DE-thorsten-high.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/high/de_DE-thorsten-high.onnx.json"
 }
 
 class PiperEngine(TTSBase):
@@ -411,6 +427,7 @@ VOSK_MODEL_SPECS = {}
 VOSK_MODEL_SPECS["en"] = {}
 VOSK_MODEL_SPECS["ar"] = {}
 VOSK_MODEL_SPECS["tr"] = {}
+VOSK_MODEL_SPECS["de"] = {}
 
 VOSK_MODEL_SPECS["en"]["small"] = "vosk-model-small-en-us-0.15"
 VOSK_MODEL_SPECS["en"]["large"] = "vosk-model-en-us-0.22"
@@ -419,6 +436,8 @@ VOSK_MODEL_SPECS["ar"]["small"] = "vosk-model-ar-mgb2-0.4"
 VOSK_MODEL_SPECS["ar"]["large"] = "vosk-model-ar-0.22-linto-1.1.0"
 
 VOSK_MODEL_SPECS["tr"]["small"] = "vosk-model-small-tr-0.3"
+
+VOSK_MODEL_SPECS["de"]["small"] = "vosk-model-small-de-0.15"
 
 class VoskEngine(STTBase):
     """
@@ -431,6 +450,7 @@ class VoskEngine(STTBase):
     en: small, large
     ar: small, large
     tr: small
+    de: small
     """
     
     def __init__(self, model_size, language):

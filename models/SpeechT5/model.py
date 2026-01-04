@@ -171,13 +171,14 @@ class SpeechT5(torch.nn.Module):
         
         print("Extracting target speaker embedding...")
         try:
-            print(f"Streaming 1 sample from seamless-align-expressive for {target_lang}...")
+            print(f"Streaming 1 sample from google/fleurs for {target_lang}...")
             
-            subset = "deA-enA" 
+            # Use helper to get config (e.g. 'de' -> 'de_de')
+            config_name = dataset_loader._get_fleurs_config(target_lang)
             
             ds_stream = load_dataset(
-                "jhu-clsp/seamless-align-expressive", 
-                subset, # Using specific subset
+                "google/fleurs", 
+                config_name,
                 streaming=True, 
                 trust_remote_code=True,
                 split="train"
@@ -187,8 +188,8 @@ class SpeechT5(torch.nn.Module):
             
             # Iterate a few samples to find valid audio
             for sample in ds_stream:
-                if 'src_audio' in sample:
-                    arr = sample['src_audio']['array']
+                if 'audio' in sample:
+                    arr = sample['audio']['array']
                     if len(arr) > 0:
                         tgt_waveform = torch.tensor(arr).unsqueeze(0).to(spk_classifier.device)
                         break
@@ -243,17 +244,17 @@ class SpeechT5(torch.nn.Module):
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
-    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate, resume_from_checkpoint=None, use_lora=False):
+    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate):
         print(f"Starting fine-tuning: {source_lang} -> {target_lang}")
         
         # --- CONFIGURATION ---
         GRAD_ACCUM_STEPS = 8  # Simulate batch size of 8 (8 * 1 = 8)
         
         # 1. Load Preprocessed Datasets
-        preprocessed_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}_v2")
+        preprocessed_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}_v2_cleaned")
         
         if not os.path.exists(preprocessed_path):
-            alt_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}")
+            alt_path = os.path.join(dataset_loader.DATASETS_DIR, f"processed_speecht5_{source_lang}_{target_lang}_v2_cleaned")
             if os.path.exists(alt_path):
                 preprocessed_path = alt_path
             else:
@@ -276,20 +277,9 @@ class SpeechT5(torch.nn.Module):
         if self.target_embeddings is None:
             self.get_speaker_embedding(target_lang)
 
-        # 3. Configure Model
-        if use_lora:
-            print("Enabling LoRA...")
-            peft_config = LoraConfig(inference_mode=False, r=16, lora_alpha=32, lora_dropout=0.1, target_modules=["k_proj", "v_proj", "q_proj", "out_proj"])
-            self.model = get_peft_model(self.model, peft_config)
-            self.model.print_trainable_parameters()
-        else:
-             print("LoRA Disabled. Freezing Feature Encoder.")
-             self.model.freeze_feature_encoder()
+        print("Freezing Feature Encoder.")
+        self.model.freeze_feature_encoder()
              
-        if resume_from_checkpoint:
-            print(f"Resuming from {resume_from_checkpoint}")
-            self.model = PeftModel.from_pretrained(self.model, resume_from_checkpoint)
-        
         self.model.train()
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
         
