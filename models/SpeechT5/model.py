@@ -213,14 +213,6 @@ class SpeechT5(torch.nn.Module):
         gc.collect()
 
     def run_inference(self, audio_array, sampling_rate, speaker_embedding=None, threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
-        # Limit input duration to avoid positional encoding overflow (model max ~30s output)
-        duration = len(audio_array) / sampling_rate
-        MAX_DURATION = 10.0 
-        
-        if duration > MAX_DURATION:
-             print(f"Audio truncated to {MAX_DURATION:.2f}s (from {duration:.2f}s) to prevent model overflow.")
-             max_samples = int(MAX_DURATION * sampling_rate)
-             audio_array = audio_array[:max_samples]
 
         inputs = self.processor(audio=audio_array, sampling_rate=sampling_rate, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
