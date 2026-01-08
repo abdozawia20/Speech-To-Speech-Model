@@ -25,10 +25,10 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
     # Configuration
     # Model is in the same directory as this script by default
     if model_path is None:
-        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speecht5_v1")
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speecht5_en_de_partially_trained")
     
     if output_file is None:
-        output_file = os.path.join(PROJECT_ROOT, "evaluation_results.json")
+        output_file = os.path.join(PROJECT_ROOT, "speecht5.json")
         
     MODEL_PATH = model_path
     NUM_SAMPLES_PER_LANG = num_samples
@@ -56,7 +56,7 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
     
     datasets = load_data(
         lang=['en', 'de'], 
-        split='test', 
+        split='train', 
         num_samples=NUM_SAMPLES_PER_LANG, 
         dataset=['fleurs']
     )
@@ -165,14 +165,14 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
         }
 
     # 6. Save Results
-    logger.info(f"Saving results to {OUTPUT_FILE}...")
+    logger.info(f"Saving results to {output_file}...")
     
     def serialize(obj):
         if isinstance(obj, np.float32): return float(obj)
         if isinstance(obj, np.float64): return float(obj)
         raise TypeError
         
-    with open(OUTPUT_FILE, 'w') as f:
+    with open(output_file, 'w') as f:
         json.dump(final_scores, f, indent=4, default=serialize)
     
     logger.info("Evaluation Complete.")
