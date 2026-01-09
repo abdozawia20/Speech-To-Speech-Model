@@ -169,20 +169,17 @@ def analyze():
                 # 2. Get Target Text (Simulated Translation)
                 tgt_text_gt = tgt_item['transcription']
                 # A. Run STT on Source
-                print(f"  [DEBUG] Starting STT Source...", flush=True)
                 text_A_hyp = stt_A.transcribe(src_audio, src_sr)
                 print(f"  [STT] Source: {text_A_hyp}")
                 
                 # B. Translation (NLLB)
                 # Use STT hypothesis as input to MT
-                print(f"  [DEBUG] Starting MT...", flush=True)
                 tgt_text_translated = mt_engine.translate(text_A_hyp)
                 print(f"  [MT] {src_lang}->{tgt_lang}: {tgt_text_translated}")
 
                 # C. Run TTS on Translated Text
                 # Output of TTS run_inference is ... dict with 'audio' or file path?
                 # PiperEngine.run_inference returns {'audio': {'array':..., 'sampling_rate':...}}
-                print(f"  [DEBUG] Starting TTS...", flush=True)
                 tts_out = tts_B.run_inference(tgt_text_translated)
                 
                 if not tts_out or 'audio' not in tts_out:
@@ -191,21 +188,9 @@ def analyze():
                     
                 audio_B_syn = tts_out['audio']['array']
                 sr_B_syn = tts_out['audio']['sampling_rate']
-                
-                # Check for NaNs or excessive values
-                has_nan = np.isnan(audio_B_syn).any()
-                min_val = np.min(audio_B_syn) if len(audio_B_syn) > 0 else 0
-                max_val = np.max(audio_B_syn) if len(audio_B_syn) > 0 else 0
-                print(f"  [DEBUG] Audio B Stats: Shape={audio_B_syn.shape}, SR={sr_B_syn}, Min={min_val:.4f}, Max={max_val:.4f}, HasNaN={has_nan}", flush=True)
-
-                if has_nan:
-                    print(f"  [WARNING] TTS output contains NaNs. Skipping ID {cid}.")
-                    continue
 
                 # D. Run STT on Synthesized Audio
-                print(f"  [DEBUG] Starting STT Verifier...", flush=True)
                 text_B_rec = stt_B_Verifier.transcribe(audio_B_syn, sr_B_syn)
-                print(f"  [DEBUG] Finished STT Verifier.", flush=True)
 
                 # Collect for Metrics
                 src_texts.append(src_text_gt)
