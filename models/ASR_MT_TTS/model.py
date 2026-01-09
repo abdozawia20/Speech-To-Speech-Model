@@ -214,24 +214,28 @@ class PiperEngine(TTSBase):
         cmd = [self.piper_binary, "--model", self.current_onnx_path, "--output_file", "-"]
         
         try:
-           # Use subprocess.run to pipe input and capture output directly
-           result = subprocess.run(
-               cmd,
-               input=text_input.encode('utf-8'),
-               capture_output=True,
-               check=True
-           )
+            # Use subprocess.run to pipe input and capture output directly
+            result = subprocess.run(
+                cmd,
+                input=text_input.encode('utf-8'),
+                capture_output=True,
+                timeout=30, # Prevent freezing
+                check=True
+            )
            
-           # Read from memory
-           with io.BytesIO(result.stdout) as wav_io:
-               data, samplerate = sf.read(wav_io)
+            # Read from memory
+            with io.BytesIO(result.stdout) as wav_io:
+                data, samplerate = sf.read(wav_io)
                
-           return {
-               'audio': {
-                   'array': data,
-                   'sampling_rate': samplerate
-               }
-           }
+            return {
+                'audio': {
+                    'array': data,
+                    'sampling_rate': samplerate
+                }
+            }
+        except subprocess.TimeoutExpired:
+            print(f"Error: Piper timed out after 30s.")
+            return None
         except subprocess.CalledProcessError as e:
             print(f"Error running Piper: {e}")
             if e.stderr:
@@ -390,6 +394,7 @@ class WhisperEngine(STTBase):
         return self.model
 
     def transcribe(self, audio_array, sample_rate):
+        print(f"  [DEBUG] Entering WhisperEngine.transcribe. SR={sample_rate}, ArrayShape={getattr(audio_array, 'shape', 'Unknown')}", flush=True)
         if audio_array is None or len(audio_array) == 0:
             raise ValueError("audio_array cannot be 'None' or empty")
         
@@ -398,14 +403,38 @@ class WhisperEngine(STTBase):
              raise TypeError(f"audio_array must be a numpy array or list, got {type(audio_array)}")
         
         if isinstance(audio_array, list):
+            print("  [DEBUG] Converting list to numpy...", flush=True)
             audio_array = np.array(audio_array)
 
         if sample_rate != 16000:
-            audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+            print(f"Resampling audio from {sample_rate} to 16000 Hz...", flush=True)
+            # Use torchaudio for faster/safer resampling
+            import torchaudio
+            import torch
+            
+            # audio_array is numpy (C, T) or (T,). Whisper expects (T,)
+            # Convert to torch tensor
+            print("  [DEBUG] Converting to tensor...", flush=True)
+            audio_tensor = torch.from_numpy(audio_array).float()
+            
+            # Add channel dim if missing for resample: (C, T)
+            if audio_tensor.ndim == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            
+            # Resample
+            print("  [DEBUG] Performing resampling...", flush=True)
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            audio_tensor = resampler(audio_tensor)
+            
+            # Squeeze back
+            print("  [DEBUG] Converting back to numpy...", flush=True)
+            audio_tensor = audio_tensor.squeeze()
+            audio_array = audio_tensor.numpy()
             sample_rate = 16000
         
-        print(f"Transcribing audio file (Whisper)...")
+        print(f"Transcribing audio file (Whisper)...", flush=True)
         try:
+            print("  [DEBUG] Calling self.model.transcribe...", flush=True)
             segments, info = self.model.transcribe(
                 audio_array,
                 beam_size=5,
@@ -424,6 +453,8 @@ class WhisperEngine(STTBase):
 
             return full_text
         except Exception as e:
+            print(f"Error during transcription: {e}")
+            return ""
             print(f"Error during transcription: {e}")
             return ""
 
@@ -602,7 +633,7 @@ class NLLBEngine(MTBase):
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             
             # Load model
-            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float16)
             
             # Apply dynamic quantization if on CPU to reduce size/latency
             if not torch.cuda.is_available():
