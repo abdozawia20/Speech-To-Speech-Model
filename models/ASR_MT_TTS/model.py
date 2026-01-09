@@ -15,6 +15,8 @@ import zipfile
 import json
 from faster_whisper import WhisperModel
 import vosk
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
 
 # AMD Fix: Force MKL to use AVX2 on AMD CPUs for better performance
 os.environ["MKL_DEBUG_CPU_TYPE"] = "5"
@@ -90,8 +92,8 @@ PIPER_MODEL_SPECS["ar"]["medium"] = {
 }
 
 PIPER_MODEL_SPECS["tr"]["medium"] = {
-    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
-    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
 }
 
 PIPER_MODEL_SPECS["de"]["low"] = {
@@ -117,6 +119,8 @@ class PiperEngine(TTSBase):
         self.current_model_language = None
         self.piper_binary = None
         self.piper_url = None
+        self.current_onnx_path = None
+        self.current_model_name = None
         
         # OS Detection
         self.system = platform.system()
@@ -204,30 +208,34 @@ class PiperEngine(TTSBase):
     def run_inference(self, text_input):
         print(f"Generating audio for the following text (Piper): \n '{text_input}'")
         if not self.current_onnx_path:
-             print("Error: No voice model loaded.")
+             print("Error: No voice model loaded (current_onnx_path is None).")
              return None
 
         cmd = [self.piper_binary, "--model", self.current_onnx_path, "--output_file", "-"]
         
         try:
-           # Use subprocess.run to pipe input and capture output directly
-           result = subprocess.run(
-               cmd,
-               input=text_input.encode('utf-8'),
-               capture_output=True,
-               check=True
-           )
+            # Use subprocess.run to pipe input and capture output directly
+            result = subprocess.run(
+                cmd,
+                input=text_input.encode('utf-8'),
+                capture_output=True,
+                timeout=30, # Prevent freezing
+                check=True
+            )
            
-           # Read from memory
-           with io.BytesIO(result.stdout) as wav_io:
-               data, samplerate = sf.read(wav_io)
+            # Read from memory
+            with io.BytesIO(result.stdout) as wav_io:
+                data, samplerate = sf.read(wav_io)
                
-           return {
-               'audio': {
-                   'array': data,
-                   'sampling_rate': samplerate
-               }
-           }
+            return {
+                'audio': {
+                    'array': data,
+                    'sampling_rate': samplerate
+                }
+            }
+        except subprocess.TimeoutExpired:
+            print(f"Error: Piper timed out after 30s.")
+            return None
         except subprocess.CalledProcessError as e:
             print(f"Error running Piper: {e}")
             if e.stderr:
@@ -386,6 +394,7 @@ class WhisperEngine(STTBase):
         return self.model
 
     def transcribe(self, audio_array, sample_rate):
+        print(f"  [DEBUG] Entering WhisperEngine.transcribe. SR={sample_rate}, ArrayShape={getattr(audio_array, 'shape', 'Unknown')}", flush=True)
         if audio_array is None or len(audio_array) == 0:
             raise ValueError("audio_array cannot be 'None' or empty")
         
@@ -394,14 +403,38 @@ class WhisperEngine(STTBase):
              raise TypeError(f"audio_array must be a numpy array or list, got {type(audio_array)}")
         
         if isinstance(audio_array, list):
+            print("  [DEBUG] Converting list to numpy...", flush=True)
             audio_array = np.array(audio_array)
 
         if sample_rate != 16000:
-            audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+            print(f"Resampling audio from {sample_rate} to 16000 Hz...", flush=True)
+            # Use torchaudio for faster/safer resampling
+            import torchaudio
+            import torch
+            
+            # audio_array is numpy (C, T) or (T,). Whisper expects (T,)
+            # Convert to torch tensor
+            print("  [DEBUG] Converting to tensor...", flush=True)
+            audio_tensor = torch.from_numpy(audio_array).float()
+            
+            # Add channel dim if missing for resample: (C, T)
+            if audio_tensor.ndim == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            
+            # Resample
+            print("  [DEBUG] Performing resampling...", flush=True)
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            audio_tensor = resampler(audio_tensor)
+            
+            # Squeeze back
+            print("  [DEBUG] Converting back to numpy...", flush=True)
+            audio_tensor = audio_tensor.squeeze()
+            audio_array = audio_tensor.numpy()
             sample_rate = 16000
         
-        print(f"Transcribing audio file (Whisper)...")
+        print(f"Transcribing audio file (Whisper)...", flush=True)
         try:
+            print("  [DEBUG] Calling self.model.transcribe...", flush=True)
             segments, info = self.model.transcribe(
                 audio_array,
                 beam_size=5,
@@ -420,6 +453,8 @@ class WhisperEngine(STTBase):
 
             return full_text
         except Exception as e:
+            print(f"Error during transcription: {e}")
+            return ""
             print(f"Error during transcription: {e}")
             return ""
 
@@ -551,4 +586,115 @@ class STTEngine():
     def transcribe(self, audio_array, sample_rate):
         if self.engine:
             return self.engine.transcribe(audio_array, sample_rate)
-        return "Error: No engine loaded."
+
+class MTBase:
+    def load_model(self, model_name):
+        raise NotImplementedError
+    def translate(self, text):
+        raise NotImplementedError
+
+class NLLBEngine(MTBase):
+    """
+    NLLB (No Language Left Behind) Engine
+    Uses facebook/nllb-200-distilled-600M (default small)
+    Supports int8 dynamic quantization for CPU speedup.
+    """
+    
+    LANG_CODES = {
+        "en": "eng_Latn",
+        "tr": "tur_Latn",
+        "de": "deu_Latn",
+        "ar": "arb_Arab",
+        "fr": "fra_Latn",
+        "es": "spa_Latn",
+        "ru": "rus_Cyrl",
+    }
+
+    def __init__(self, model_size="small", src_lang="en", target_lang="tr"):
+        self.tokenizer = None
+        self.model = None
+        self.src_lang = src_lang
+        self.target_lang = target_lang
+        self.model_name = "facebook/nllb-200-distilled-600M" # Default small
+        
+        if model_size == "medium":
+           self.model_name = "facebook/nllb-200-distilled-1.3B"
+        elif model_size == "large":
+           self.model_name = "facebook/nllb-200-3.3B"
+           
+        self.load_model(self.model_name)
+
+    def _get_nllb_code(self, lang):
+        return self.LANG_CODES.get(lang, "eng_Latn") # Fallback to English
+
+    def load_model(self, model_name):
+        print(f"Loading NLLB Model: {model_name}...")
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # Load model
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name, dtype=torch.float16)
+            
+            # Apply dynamic quantization if on CPU to reduce size/latency
+            if not torch.cuda.is_available():
+                print("Quantizing NLLB model to int8 (CPU)...")
+                self.model = torch.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+            else:
+                self.model = model.to("cuda")
+                
+            print("NLLB Model loaded successfully.")
+        except Exception as e:
+            print(f"Error loading NLLB model: {e}")
+
+    def translate(self, text):
+        if not self.model or not self.tokenizer:
+            return "Error: MT Model not loaded."
+            
+        src_code = self._get_nllb_code(self.src_lang)
+        tgt_code = self._get_nllb_code(self.target_lang)
+        
+        print(f"Translating ({src_code} -> {tgt_code}): {text}")
+
+        try:
+            # Tokenizer setup for NLLB
+            self.tokenizer.src_lang = src_code
+            inputs = self.tokenizer(text, return_tensors="pt")
+            
+            if torch.cuda.is_available():
+                inputs = inputs.to("cuda")
+
+            generated_tokens = self.model.generate(
+                **inputs,
+                forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(tgt_code),
+                max_length=128
+            )
+            
+            result = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+            return result
+        except Exception as e:
+            print(f"Translation Error: {e}")
+            return text
+
+class MTEngine():
+    """
+    Facade for Machine Translation
+    Engines: 'nllb'
+    """
+    def __init__(self, engine="nllb", model_size="small", src_lang="en", target_lang="tr"):
+        self.engine = None
+        self.current_engine_name = engine
+        
+        print(f"Switching MT Engine to: {engine}...")
+        
+        if engine == "nllb":
+            self.engine = NLLBEngine(model_size, src_lang, target_lang)
+        else:
+             print(f"WARNING: MT Engine '{engine}' not found. Defaulting to NLLB.")
+             self.engine = NLLBEngine(model_size, src_lang, target_lang)
+
+    def translate(self, text):
+        if self.engine:
+            return self.engine.translate(text)
+        return text
