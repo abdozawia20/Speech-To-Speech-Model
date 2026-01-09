@@ -15,6 +15,8 @@ import zipfile
 import json
 from faster_whisper import WhisperModel
 import vosk
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
 
 # AMD Fix: Force MKL to use AVX2 on AMD CPUs for better performance
 os.environ["MKL_DEBUG_CPU_TYPE"] = "5"
@@ -90,8 +92,8 @@ PIPER_MODEL_SPECS["ar"]["medium"] = {
 }
 
 PIPER_MODEL_SPECS["tr"]["medium"] = {
-    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
-    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/main/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
+    "onnx": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx",
+    "json": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json"
 }
 
 PIPER_MODEL_SPECS["de"]["low"] = {
@@ -117,6 +119,8 @@ class PiperEngine(TTSBase):
         self.current_model_language = None
         self.piper_binary = None
         self.piper_url = None
+        self.current_onnx_path = None
+        self.current_model_name = None
         
         # OS Detection
         self.system = platform.system()
@@ -204,7 +208,7 @@ class PiperEngine(TTSBase):
     def run_inference(self, text_input):
         print(f"Generating audio for the following text (Piper): \n '{text_input}'")
         if not self.current_onnx_path:
-             print("Error: No voice model loaded.")
+             print("Error: No voice model loaded (current_onnx_path is None).")
              return None
 
         cmd = [self.piper_binary, "--model", self.current_onnx_path, "--output_file", "-"]
@@ -551,4 +555,115 @@ class STTEngine():
     def transcribe(self, audio_array, sample_rate):
         if self.engine:
             return self.engine.transcribe(audio_array, sample_rate)
-        return "Error: No engine loaded."
+
+class MTBase:
+    def load_model(self, model_name):
+        raise NotImplementedError
+    def translate(self, text):
+        raise NotImplementedError
+
+class NLLBEngine(MTBase):
+    """
+    NLLB (No Language Left Behind) Engine
+    Uses facebook/nllb-200-distilled-600M (default small)
+    Supports int8 dynamic quantization for CPU speedup.
+    """
+    
+    LANG_CODES = {
+        "en": "eng_Latn",
+        "tr": "tur_Latn",
+        "de": "deu_Latn",
+        "ar": "arb_Arab",
+        "fr": "fra_Latn",
+        "es": "spa_Latn",
+        "ru": "rus_Cyrl",
+    }
+
+    def __init__(self, model_size="small", src_lang="en", target_lang="tr"):
+        self.tokenizer = None
+        self.model = None
+        self.src_lang = src_lang
+        self.target_lang = target_lang
+        self.model_name = "facebook/nllb-200-distilled-600M" # Default small
+        
+        if model_size == "medium":
+           self.model_name = "facebook/nllb-200-distilled-1.3B"
+        elif model_size == "large":
+           self.model_name = "facebook/nllb-200-3.3B"
+           
+        self.load_model(self.model_name)
+
+    def _get_nllb_code(self, lang):
+        return self.LANG_CODES.get(lang, "eng_Latn") # Fallback to English
+
+    def load_model(self, model_name):
+        print(f"Loading NLLB Model: {model_name}...")
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            
+            # Load model
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+            
+            # Apply dynamic quantization if on CPU to reduce size/latency
+            if not torch.cuda.is_available():
+                print("Quantizing NLLB model to int8 (CPU)...")
+                self.model = torch.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+            else:
+                self.model = model.to("cuda")
+                
+            print("NLLB Model loaded successfully.")
+        except Exception as e:
+            print(f"Error loading NLLB model: {e}")
+
+    def translate(self, text):
+        if not self.model or not self.tokenizer:
+            return "Error: MT Model not loaded."
+            
+        src_code = self._get_nllb_code(self.src_lang)
+        tgt_code = self._get_nllb_code(self.target_lang)
+        
+        print(f"Translating ({src_code} -> {tgt_code}): {text}")
+
+        try:
+            # Tokenizer setup for NLLB
+            self.tokenizer.src_lang = src_code
+            inputs = self.tokenizer(text, return_tensors="pt")
+            
+            if torch.cuda.is_available():
+                inputs = inputs.to("cuda")
+
+            generated_tokens = self.model.generate(
+                **inputs,
+                forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(tgt_code),
+                max_length=128
+            )
+            
+            result = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+            return result
+        except Exception as e:
+            print(f"Translation Error: {e}")
+            return text
+
+class MTEngine():
+    """
+    Facade for Machine Translation
+    Engines: 'nllb'
+    """
+    def __init__(self, engine="nllb", model_size="small", src_lang="en", target_lang="tr"):
+        self.engine = None
+        self.current_engine_name = engine
+        
+        print(f"Switching MT Engine to: {engine}...")
+        
+        if engine == "nllb":
+            self.engine = NLLBEngine(model_size, src_lang, target_lang)
+        else:
+             print(f"WARNING: MT Engine '{engine}' not found. Defaulting to NLLB.")
+             self.engine = NLLBEngine(model_size, src_lang, target_lang)
+
+    def translate(self, text):
+        if self.engine:
+            return self.engine.translate(text)
+        return text
