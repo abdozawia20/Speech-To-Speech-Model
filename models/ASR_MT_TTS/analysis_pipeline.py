@@ -2,6 +2,11 @@ import os
 # Disable symlinks warning on Windows for Hugging Face Hub
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
+import sys
+# Add project root to sys.path to allow importing dataset_loader from root
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 import numpy as np
 import librosa
@@ -9,8 +14,8 @@ import soundfile as sf
 import evaluate
 from datasets import load_dataset
 from model import *
-from ..dataset_loader import *
-from tqdm import tqdm
+from dataset_loader import *
+import gc
 import json
 
 # Initialize Metrics
@@ -70,8 +75,11 @@ def calculate_metrics(predictions, references, sources=None):
 def analyze():
     # 1. Load Dataset
     print("Loading Test Data...")
-    data = load_test_data(page=1, page_size=10000) # Use smaller size for dev/testing, user can increase.
-    # User said "The dataset... using load_test_data"
+
+    # data = load_test_data(page=1, page_size=10000) 
+    # load_data(start_idx, num_samples, encoding, lang, split, dataset)
+    # Loading 'en', 'ar', 'tr' for test split.
+    data = load_data(start_idx=0, num_samples=2000, lang=['en', 'de'], split='train')
     
     # 2. Build ID Lookups
     # data is dict: {'en': dataset, 'ar': dataset, ...}
@@ -92,10 +100,8 @@ def analyze():
 
     # 3. Define Pairs
     pairs = [
-        ('en', 'ar'),
-        ('en', 'tr'),
-        ('ar', 'en'),
-        ('tr', 'en'),
+        ('en', 'de')
+
         # Add more if needed. 'tr'<->'ar' might not share IDs in FLEURS? 
         # FLEURS is n-way parallel usually.
     ]
@@ -116,7 +122,7 @@ def analyze():
         # Filter intersection
         src_ids = set(id_maps[src_lang].keys())
         tgt_ids = set(id_maps[tgt_lang].keys())
-        common_ids = list(src_ids.intersection(tgt_ids))
+        common_ids = sorted(list(src_ids.intersection(tgt_ids)))
         
         if not common_ids:
             print(f"No common matching IDs found for {src_lang}->{tgt_lang}. Skipping.")
@@ -126,44 +132,55 @@ def analyze():
         
         # Initialize Engines for this language pair
         # Step 1: STT (Language A) - mostly for completeness/logging
-        stt_A = STTEngine(engine="whisper", language=src_lang, model_size="large")
+        stt_A = STTEngine(engine="whisper", language=src_lang, model_size="small")
         
         # Step 2: TTS (Language B)
         # Piper specs in STT_TTS_models.py: en, ar, tr supported.
-        tts_B = TTSEngine(engine="piper", language=tgt_lang, model_size="high") # or medium
+        tts_B = TTSEngine(engine="piper", language=tgt_lang, model_size="low") # or medium
 
         # Step 3: STT (Language B) - Verifier
-        stt_B_Verifier = STTEngine(engine="whisper", language=tgt_lang, model_size="large")
+        stt_B_Verifier = STTEngine(engine="whisper", language=tgt_lang, model_size="small")
+
+        # Step 4: MT (Language A -> Language B)
+        # Using NLLB Small (Int8 quantized if CPU, FP16 if CUDA)
+        mt_engine = MTEngine(engine="nllb", model_size="small", src_lang=src_lang, target_lang=tgt_lang)
 
         tgt_refs = []
         tgt_preds = []
         src_texts = [] # For COMET
 
         # Limit for demonstration speed
-        MAX_SAMPLES = 10 
+        MAX_SAMPLES = 2000
         print(f"Running pipeline on first {MAX_SAMPLES} samples...")
 
-        for cid in tqdm(common_ids[:MAX_SAMPLES]):
-            src_item = id_maps[src_lang][cid]
-            tgt_item = id_maps[tgt_lang][cid]
-
-            # 1. Get Source Audio/Text
-            src_audio = src_item['audio']['array']
-            src_sr = src_item['audio']['sampling_rate']
-            src_text_gt = src_item['transcription']
-
-            # 2. Get Target Text (Simulated Translation)
-            tgt_text_gt = tgt_item['transcription']
+        for i, cid in enumerate(common_ids[:MAX_SAMPLES]):
+            print(f"Processing {i+1}/{len(common_ids[:MAX_SAMPLES])} - ID: {cid}", flush=True)
 
             # 3. Run Pipeline
             try:
-                # A. Run STT on Source (Optional, but requested "run STT int one language")
-                # text_A_hyp = stt_A.transcribe(src_audio, src_sr)
+                src_item = id_maps[src_lang][cid]
+                tgt_item = id_maps[tgt_lang][cid]
+
+                # 1. Get Source Audio/Text
+                src_audio = src_item['audio']['array']
+                src_sr = src_item['audio']['sampling_rate']
+                src_text_gt = src_item['transcription']
+
+                # 2. Get Target Text (Simulated Translation)
+                tgt_text_gt = tgt_item['transcription']
+                # A. Run STT on Source
+                text_A_hyp = stt_A.transcribe(src_audio, src_sr)
+                print(f"  [STT] Source: {text_A_hyp}")
                 
-                # B. Run TTS on Target Text (Ground Truth as proxy for Translation Output)
+                # B. Translation (NLLB)
+                # Use STT hypothesis as input to MT
+                tgt_text_translated = mt_engine.translate(text_A_hyp)
+                print(f"  [MT] {src_lang}->{tgt_lang}: {tgt_text_translated}")
+
+                # C. Run TTS on Translated Text
                 # Output of TTS run_inference is ... dict with 'audio' or file path?
                 # PiperEngine.run_inference returns {'audio': {'array':..., 'sampling_rate':...}}
-                tts_out = tts_B.run_inference(tgt_text_gt)
+                tts_out = tts_B.run_inference(tgt_text_translated)
                 
                 if not tts_out or 'audio' not in tts_out:
                     print(f"TTS Failed for {cid}")
@@ -172,7 +189,7 @@ def analyze():
                 audio_B_syn = tts_out['audio']['array']
                 sr_B_syn = tts_out['audio']['sampling_rate']
 
-                # C. Run STT on Synthesized Audio
+                # D. Run STT on Synthesized Audio
                 text_B_rec = stt_B_Verifier.transcribe(audio_B_syn, sr_B_syn)
 
                 # Collect for Metrics
@@ -182,6 +199,17 @@ def analyze():
 
             except Exception as e:
                 print(f"Pipeline Error on id {cid}: {e}")
+            finally:
+                # cleanup
+                if 'src_audio' in locals(): del src_audio
+                if 'text_A_hyp' in locals(): del text_A_hyp
+                if 'tgt_text_translated' in locals(): del tgt_text_translated
+                if 'audio_B_syn' in locals(): del audio_B_syn
+                if 'text_B_rec' in locals(): del text_B_rec
+                
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Compute Metrics
         if tgt_preds:
@@ -194,3 +222,6 @@ def analyze():
     with open("analysis_results.json", "w") as f:
         json.dump(results_log, f, indent=4)
         print("\nResults saved to analysis_results.json")
+
+if __name__ == "__main__":
+    analyze()
