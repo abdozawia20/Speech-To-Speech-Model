@@ -18,12 +18,15 @@ from dataset_loader import *
 import gc
 import json
 
+from speechbrain.inference.speaker import EncoderClassifier
+from scipy.spatial.distance import cosine
+
 # Initialize Metrics
 bleu = evaluate.load("bleu")
 rouge = evaluate.load("rouge")
 comet = evaluate.load("comet")
 
-def calculate_metrics(predictions, references, sources=None):
+def calculate_metrics(predictions, references, sources=None, cosine_similarities=None):
     """
     Calculates BLEU, ROUGE, and COMET scores.
     Args:
@@ -70,6 +73,12 @@ def calculate_metrics(predictions, references, sources=None):
     else:
         results['comet'] = None
 
+    # Cosine Similarity
+    if cosine_similarities:
+        results['cosine_similarity'] = float(np.mean(cosine_similarities))
+    else:
+        results['cosine_similarity'] = None
+
     return results
 
 def analyze():
@@ -115,6 +124,17 @@ def analyze():
     
     print("Initializing Engines...")
     # Pre-warm engines if needed
+
+    print("Initializing SpeechBrain EncoderClassifier for Cosine Similarity...")
+    try:
+        spk_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb", 
+            savedir="tmp_spkrec", 
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+        )
+    except Exception as e:
+        print(f"Failed to load speaker classifier: {e}")
+        spk_classifier = None
     
     for src_lang, tgt_lang in pairs:
         print(f"\nProcessing Pair: {src_lang} -> {tgt_lang}")
@@ -148,6 +168,7 @@ def analyze():
         tgt_refs = []
         tgt_preds = []
         src_texts = [] # For COMET
+        cos_sims = [] # For Cosine Similarity
 
         # Limit for demonstration speed
         MAX_SAMPLES = 2000
@@ -192,6 +213,22 @@ def analyze():
                 # D. Run STT on Synthesized Audio
                 text_B_rec = stt_B_Verifier.transcribe(audio_B_syn, sr_B_syn)
 
+                # E. Calculate Cosine Similarity
+                if spk_classifier is not None:
+                    try:
+                        # Ensure shapes are [batch, time]
+                        src_tensor = torch.tensor(src_audio).unsqueeze(0).to(spk_classifier.device)
+                        pred_tensor = torch.tensor(audio_B_syn).unsqueeze(0).to(spk_classifier.device)
+                        
+                        with torch.no_grad():
+                            src_emb = spk_classifier.encode_batch(src_tensor).squeeze().cpu().numpy()
+                            pred_emb = spk_classifier.encode_batch(pred_tensor).squeeze().cpu().numpy()
+                            
+                        similarity = 1 - cosine(src_emb, pred_emb)
+                        cos_sims.append(similarity)
+                    except Exception as e:
+                        print(f"Failed to calculate cosine similarity for id {cid}: {e}")
+
                 # Collect for Metrics
                 src_texts.append(src_text_gt)
                 tgt_refs.append(tgt_text_gt)
@@ -213,7 +250,7 @@ def analyze():
 
         # Compute Metrics
         if tgt_preds:
-            scores = calculate_metrics(tgt_preds, tgt_refs, sources=src_texts)
+            scores = calculate_metrics(tgt_preds, tgt_refs, sources=src_texts, cosine_similarities=cos_sims)
             scores['pair'] = f"{src_lang}->{tgt_lang}"
             print(f"Scores for {src_lang}->{tgt_lang}: {scores}")
             results_log.append(scores)
