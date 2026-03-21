@@ -8,6 +8,8 @@ from tqdm import tqdm
 from transformers import pipeline
 import evaluate
 from comet import download_model, load_from_checkpoint
+from speechbrain.inference.speaker import EncoderClassifier
+from scipy.spatial.distance import cosine
 
 # Add project root to sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -83,10 +85,21 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
         logger.warning(f"Failed to load COMET via evaluate: {e}. Trying raw comet check...")
         comet_metric = None
 
+    logger.info("Initializing SpeechBrain EncoderClassifier for Cosine Similarity...")
+    try:
+        spk_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb", 
+            savedir="tmp_spkrec", 
+            run_opts={"device": device}
+        )
+    except Exception as e:
+        logger.error(f"Failed to load speaker classifier: {e}")
+        spk_classifier = None
+
     # Store results
     results = {
-        "en_to_de": {"references": [], "predictions": [], "sources": []},
-        "de_to_en": {"references": [], "predictions": [], "sources": []}
+        "en_to_de": {"references": [], "predictions": [], "sources": [], "cosine_similarities": []},
+        "de_to_en": {"references": [], "predictions": [], "sources": [], "cosine_similarities": []}
     }
 
     # Helper for inference loop
@@ -127,6 +140,22 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
                 results[key]["references"].append(ref_text)
                 results[key]["sources"].append(src_text)
                 
+                # Check cosine similarity
+                if spk_classifier is not None:
+                    try:
+                        # Ensure shapes are [batch, time]
+                        src_tensor = torch.tensor(src_audio).unsqueeze(0).to(device)
+                        pred_tensor = torch.tensor(pred_audio).unsqueeze(0).to(device)
+                        
+                        with torch.no_grad():
+                            src_emb = spk_classifier.encode_batch(src_tensor).squeeze().cpu().numpy()
+                            pred_emb = spk_classifier.encode_batch(pred_tensor).squeeze().cpu().numpy()
+                            
+                        similarity = 1 - cosine(src_emb, pred_emb)
+                        results[key]["cosine_similarities"].append(similarity)
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate cosine similarity for index {i}: {e}")
+                
             except Exception as e:
                 logger.error(f"Error at index {i}: {e}")
                 continue
@@ -143,6 +172,7 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
         preds = data["predictions"]
         refs = data["references"]
         srcs = data["sources"]
+        cos_sims = data.get("cosine_similarities", [])
         
         if not preds:
             continue
@@ -157,11 +187,14 @@ def analyze(num_samples=2000, model_path=None, output_file=None):
                 comet_score = {"mean_score": comet_res["mean_score"]}
             except Exception as e:
                 logger.error(f"COMET computation failed for {direction}: {e}")
+                
+        avg_cos_sim = float(np.mean(cos_sims)) if cos_sims else 0.0
         
         final_scores[direction] = {
             "bleu": bleu_score,
             "rouge": rouge_score,
-            "comet": comet_score
+            "comet": comet_score,
+            "cosine_similarity": avg_cos_sim
         }
 
     # 6. Save Results
