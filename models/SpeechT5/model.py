@@ -3,7 +3,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torchaudio
 import numpy as np
-from transformers import SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan
+from transformers import (
+    SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
+    Wav2Vec2Processor, Wav2Vec2Model,
+)
 from transformers.modeling_outputs import BaseModelOutput
 from datasets import load_from_disk, load_dataset
 import dataset_loader
@@ -156,6 +159,10 @@ class SpeechT5Dataset(Dataset):
                   norm_mel = (log_mel + 40.0) / 20.0 
                   target_features = torch.tensor(norm_mel.T, dtype=torch.float32)
 
+        # Enforce reduction_factor=2 dimension requirement
+        if target_features.shape[0] % 2 != 0:
+            target_features = target_features[:-1, :]
+
         return {
             "input_values": source_features,
             "labels": target_features,
@@ -170,7 +177,7 @@ def speecht5_collate_fn(batch):
     # pad_sequence works for both 1-D (raw audio) and 2-D (Wav2Vec hidden states)
     # because it always pads along dim-0 (the time axis).
     input_values_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True)
-    labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True)
+    labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100.0)
     speaker_embeddings_stacked = torch.stack(speaker_embeddings)
 
     # Attention mask:
@@ -270,11 +277,9 @@ class SpeechT5(torch.nn.Module):
         torch.cuda.empty_cache()
         gc.collect()
 
-    def run_inference(self, audio_array, sampling_rate, speaker_embedding=None, threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
+    def run_inference(self, audio_array, sampling_rate, speaker_embedding=None,
+                      threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
 
-        inputs = self.processor(audio=audio_array, sampling_rate=sampling_rate, return_tensors="pt")
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
         if speaker_embedding is not None:
             emb = torch.tensor(speaker_embedding).to(self.device).unsqueeze(0)
         elif self.target_embeddings is not None:
@@ -282,15 +287,99 @@ class SpeechT5(torch.nn.Module):
         else:
             emb = torch.randn((1, 512)).to(self.device)
 
-        with torch.no_grad():
-            speech = self.model.generate_speech(
-                inputs["input_values"], 
-                emb, 
-                vocoder=self.vocoder, 
-                threshold=threshold,
-                minlenratio=minlenratio,
-                maxlenratio=maxlenratio
+        if self.encoder_type == 'wav2vec':
+            # ------------------------------------------------------------------ #
+            # Wav2Vec path: encode with Wav2Vec2, then pass encoder states        #
+            # directly to the SpeechT5 decoder via encoder_outputs, bypassing    #
+            # the CNN prenet — identical to the fine-tuning pipeline.            #
+            # ------------------------------------------------------------------ #
+            if not hasattr(self, '_wav2vec_proc'):
+                print("Loading Wav2Vec2 for inference...")
+                self._wav2vec_proc  = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+                self._wav2vec_model = Wav2Vec2Model.from_pretrained("facebook/wav2vec2-base-960h").to(self.device).eval()
+                for p in self._wav2vec_model.parameters():
+                    p.requires_grad_(False)
+
+            if audio_array.ndim > 1:
+                audio_array = audio_array.flatten()
+
+            inputs = self._wav2vec_proc(
+                audio_array, sampling_rate=sampling_rate,
+                return_tensors="pt", padding=False,
             )
+            input_values = inputs.input_values.to(self.device)  # (1, T)
+
+            with torch.no_grad():
+                wav2vec_out = self._wav2vec_model(input_values)
+            hidden_states = wav2vec_out.last_hidden_state  # (1, Seq, 768)
+
+            # Attention mask: all 1s — single sample, no padding
+            attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=self.device)
+
+            with torch.no_grad():
+                encoder_out = self._encode_wav2vec_states(hidden_states, attention_mask)
+                encoder_states = encoder_out.last_hidden_state  # (1, Seq, 768)
+
+                # Manual autoregressive decoding — mirrors encoders.py decode().
+                # generate_speech() internally re-runs the CNN encoder and would
+                # ignore encoder_states, so we use the decoder directly instead.
+                config = self.model.config
+                num_mel = config.num_mel_bins
+                rf = config.reduction_factor
+                max_steps = int(maxlenratio * encoder_states.shape[1] / rf)
+                min_steps = int(minlenratio * encoder_states.shape[1] / rf)
+
+                output_seq = torch.zeros(1, 1, num_mel, device=self.device)
+                past_key_values = None
+                spectrogram = []
+
+                for step in range(max_steps):
+                    dec_hidden = self.model.speecht5.decoder.prenet(output_seq, emb)
+                    dec_out = self.model.speecht5.decoder.wrapped_decoder(
+                        hidden_states=dec_hidden[:, -1:],
+                        attention_mask=None,
+                        encoder_hidden_states=encoder_states,
+                        encoder_attention_mask=None,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    last_out = dec_out.last_hidden_state.squeeze(1)
+                    past_key_values = dec_out.past_key_values
+
+                    spectrum = self.model.speech_decoder_postnet.feat_out(last_out)
+                    spectrum = spectrum.view(1, rf, num_mel)
+                    spectrogram.append(spectrum)
+
+                    new_frame = spectrum[:, -1:, :]
+                    output_seq = torch.cat((output_seq, new_frame), dim=1)
+
+                    prob = torch.sigmoid(self.model.speech_decoder_postnet.prob_out(last_out))
+                    if step >= min_steps and prob.max() > threshold:
+                        break
+
+                if not spectrogram:
+                    return {'audio': {'array': np.zeros(16000, dtype=np.float32), 'sampling_rate': 16000}}
+
+                mel = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)  # (1, T, 80)
+                mel = self.model.speech_decoder_postnet.postnet(mel)
+                speech = self.vocoder(mel).squeeze()
+        else:
+            # ------------------------------------------------------------------ #
+            # Default path: raw waveform → SpeechT5 CNN encoder                 #
+            # ------------------------------------------------------------------ #
+            inputs = self.processor(audio=audio_array, sampling_rate=sampling_rate, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                speech = self.model.generate_speech(
+                    inputs["input_values"],
+                    emb,
+                    vocoder=self.vocoder,
+                    threshold=threshold,
+                    minlenratio=minlenratio,
+                    maxlenratio=maxlenratio,
+                )
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
@@ -308,10 +397,12 @@ class SpeechT5(torch.nn.Module):
     def _encode_wav2vec_states(self, hidden_states: torch.Tensor,
                                attention_mask: torch.Tensor) -> BaseModelOutput:
         """
-        Run Wav2Vec2 hidden states through the SpeechT5 transformer encoder
-        layers (skipping the CNN / prenet), and return a BaseModelOutput
-        that can be passed directly as ``encoder_outputs`` to
-        ``SpeechT5ForSpeechToSpeech.forward()``.
+        Pass Wav2Vec2 hidden states through the SpeechT5 transformer encoder
+        (skipping the CNN prenet), and return a BaseModelOutput suitable for
+        passing as ``encoder_outputs`` to ``SpeechT5ForSpeechToSpeech.forward()``.
+
+        Uses the full ``SpeechT5Encoder.forward()`` so that relative position
+        embeddings, LayerNorm, and LayerDrop are applied correctly.
 
         Args:
             hidden_states:  (Batch, Seq_Len, 768) — Wav2Vec2 last hidden states.
@@ -322,27 +413,16 @@ class SpeechT5(torch.nn.Module):
         """
         transformer_enc = self._get_speecht5_transformer_encoder()
 
-        # Convert the 0/1 attention mask to the extended float mask that
-        # transformer layers expect: 0.0 for real tokens, -inf for padding.
-        extended_mask = None
-        if attention_mask is not None:
-            bsz, seq_len = attention_mask.shape
-            expanded_mask = attention_mask[:, None, None, :].expand(bsz, 1, seq_len, seq_len).float()
-            extended_mask = (1.0 - expanded_mask) * torch.finfo(hidden_states.dtype).min
-
-        states = hidden_states
-        for layer in transformer_enc.layers:
-            layer_out = layer(
-                states,
-                attention_mask=extended_mask,
-                output_attentions=False,
-            )
-            states = layer_out[0]
-
-        if hasattr(transformer_enc, "layer_norm") and transformer_enc.layer_norm is not None:
-            states = transformer_enc.layer_norm(states)
-
-        return BaseModelOutput(last_hidden_state=states)
+        # Use the full SpeechT5Encoder.forward() so that:
+        #  - LayerNorm is applied to the hidden states
+        #  - Dropout is applied (training) / off (eval)
+        #  - Relative position_bias is computed and passed to every layer
+        # This matches the pre-training setup of the SpeechT5 transformer.
+        return transformer_enc(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,   # (Batch, Seq_Len) — 1 real, 0 pad
+            return_dict=True,
+        )
 
     # ---------------------------------------------------------------------- #
 
@@ -358,7 +438,7 @@ class SpeechT5(torch.nn.Module):
         if self.encoder_type == 'wav2vec':
             candidate_paths = [
                 os.path.join(dataset_loader.DATASETS_DIR,
-                             f"processed_speecht5_wav2vec_{source_lang}_{target_lang}_v1"),
+                             f"processed_speecht5_wav2vec_{source_lang}_{target_lang}_v3"),
             ]
         else:  # 'default' aka MelSpectrogram
             candidate_paths = [
@@ -430,38 +510,63 @@ class SpeechT5(torch.nn.Module):
                     # -------------------------------------------------------- #
                     # Forward pass — behaviour differs by encoder_type          #
                     # -------------------------------------------------------- #
+                    from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right, SpeechT5SpectrogramLoss
+
+                    decoder_input_values, decoder_attention_mask = shift_spectrograms_right(
+                        labels, self.model.config.reduction_factor, None
+                    )
+
                     if self.encoder_type == 'wav2vec':
-                        # input_values is (Batch, Seq_Len, 768) — Wav2Vec2 hidden
-                        # states.  We bypass SpeechT5's CNN feature encoder and
-                        # inject the states directly into its transformer layers.
+                        # input_values: (Batch, Seq_Len, 768) — Wav2Vec2 hidden states.
+                        # Bypass SpeechT5's CNN prenet and inject directly into the
+                        # transformer encoder using its full forward() so that
+                        # LayerNorm, dropout and position_bias are applied.
                         encoder_out = self._encode_wav2vec_states(
                             input_values, attention_mask
                         )
-                        outputs = self.model(
+                        outputs = self.model.speecht5(
                             encoder_outputs=encoder_out,
                             attention_mask=attention_mask, # Needed for decoder cross-attention
+                            decoder_input_values=decoder_input_values,
+                            decoder_attention_mask=decoder_attention_mask,
                             speaker_embeddings=speaker_embeddings,
-                            labels=labels,
-                            use_cache=False,  # KV-cache is inference-only; new Cache API causes unpack errors during training
+                            use_cache=False,  # KV-cache is interference-only
+                            output_attentions=True, # Guided attention loss needs this
                         )
                     else:
                         # 'default': raw normalised waveform (Batch, T).
                         # SpeechT5's own CNN encoder processes it.
-                        outputs = self.model(
+                        outputs = self.model.speecht5(
                             input_values=input_values,
                             attention_mask=attention_mask,
+                            decoder_input_values=decoder_input_values,
+                            decoder_attention_mask=decoder_attention_mask,
                             speaker_embeddings=speaker_embeddings,
-                            labels=labels,
-                            use_cache=False,  # KV-cache is inference-only
+                            use_cache=False,  # KV-cache is interference-only
+                            output_attentions=True, # Guided attention loss needs this
                         )
 
-                    loss = outputs.loss
-                    if loss is None:
-                        pred    = outputs.spectrogram
-                        min_len = min(pred.size(1), labels.size(1))
-                        loss    = torch.nn.functional.l1_loss(
-                            pred[:, :min_len, :], labels[:, :min_len, :]
+                    outputs_before_postnet, outputs_after_postnet, logits = self.model.speech_decoder_postnet(outputs[0])
+
+                    # SpeechT5SpectrogramLoss requires the ENCODER attention mask as the first parameter.
+                    # For wav2vec mode, `attention_mask` is already the correct encoder state length.
+                    # For default mode, `attention_mask` is the raw audio length, so it must be downsampled.
+                    if self.encoder_type == 'wav2vec':
+                        enc_mask_for_loss = attention_mask
+                    else:
+                        enc_mask_for_loss = self.model.speecht5.encoder.prenet._get_feature_vector_attention_mask(
+                            outputs.encoder_last_hidden_state.shape[1], attention_mask
                         )
+
+                    criterion = SpeechT5SpectrogramLoss(self.model.config)
+                    loss = criterion(
+                        enc_mask_for_loss,
+                        outputs_before_postnet,
+                        outputs_after_postnet,
+                        logits,
+                        labels,
+                        cross_attentions=outputs.cross_attentions
+                    )
 
                     (loss / GRAD_ACCUM_STEPS).backward()
 

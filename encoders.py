@@ -199,23 +199,24 @@ class Wav2VecSpeechT5Encoder(nn.Module):
             result.append(hidden_states[i].numpy())       # (S, 768)
         return result
 
-    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor, threshold: float = 0.5, minlenratio: float = 0.0, maxlenratio: float = 2.0) -> np.ndarray:
+    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor,
+               threshold: float = 0.5, minlenratio: float = 0.0,
+               maxlenratio: float = 2.0) -> np.ndarray:
         """
         Reconstruct audio from Wav2Vec2 hidden states using the SpeechT5 decoder.
 
-        The hidden states (768-dim) are projected by SpeechT5's encoder_prenet
-        into the model's hidden dim before being passed to the decoder.
+        Uses transformer_enc.forward() — matching model.py:_encode_wav2vec_states —
+        so LayerNorm, dropout, and relative position_bias are applied consistently
+        with training.
 
         Args:
-            hidden_states:     Tensor of shape (1, Seq_Len, 768).
-            speaker_embedding: Tensor of shape (512,) or (1, 512).
-            threshold, minlenratio, maxlenratio: SpeechT5 generation parameters.
+            hidden_states:     Tensor  (1, Seq_Len, 768).
+            speaker_embedding: Tensor  (512,)  or  (1, 512).
+            threshold:         Stop-token probability threshold (lower → longer output).
+            minlenratio, maxlenratio: Output length relative to encoder seq length.
 
         Returns:
-            audio_array: Reconstructed waveform as a numpy float32 array at 16 kHz.
-
-        Raises:
-            RuntimeError: If the decoder components were not loaded (load_decoder=False).
+            Reconstructed waveform as a numpy float32 array at 16 kHz.
         """
         if self.speecht5_model is None or self.vocoder is None:
             raise RuntimeError(
@@ -223,111 +224,95 @@ class Wav2VecSpeechT5Encoder(nn.Module):
                 "Re-initialise with load_decoder=True to use decode()."
             )
 
-        # Ensure (1, Seq_Len, 768)
+        # ── normalise input shapes ────────────────────────────────────────── #
         if hidden_states.dim() == 2:
-            hidden_states = hidden_states.unsqueeze(0)
+            hidden_states = hidden_states.unsqueeze(0)      # (1, S, 768)
         hidden_states = hidden_states.to(self.device)
 
-        # Ensure (1, 512)
         if speaker_embedding.dim() == 1:
-            speaker_embedding = speaker_embedding.unsqueeze(0)
+            speaker_embedding = speaker_embedding.unsqueeze(0)   # (1, 512)
         speaker_embedding = speaker_embedding.to(self.device)
 
         with torch.no_grad():
-            # 1. Skip the SpeechT5 feature encoder (conv layers) because they expect
-            # raw audio, but we already have Wav2Vec2 hidden states (Seq, 768).
-            # We assume dimensions match (Wav2Vec2 base 768 -> SpeechT5 base 768).
-            encoder_states = hidden_states.to(self.device)
-
-            # 2. Run SpeechT5 encoder transformer layers on the hidden states
-            # In some versions of transformers, the layers are inside 'wrapped_encoder'
+            # ── 1. SpeechT5 transformer encoder ──────────────────────────── #
+            # Use full forward() so LayerNorm, dropout & position_bias are
+            # applied — same as model.py:_encode_wav2vec_states.
             encoder_obj = self.speecht5_model.speecht5.encoder
-            if hasattr(encoder_obj, "wrapped_encoder"):
-                transformer_encoder = encoder_obj.wrapped_encoder
-            else:
-                transformer_encoder = encoder_obj
+            transformer_enc = (
+                encoder_obj.wrapped_encoder
+                if hasattr(encoder_obj, "wrapped_encoder")
+                else encoder_obj
+            )
 
-            for layer in transformer_encoder.layers:
-                encoder_states = layer(encoder_states)[0]
-            
-            # 3. Add final layer normalization
-            if hasattr(transformer_encoder, "layer_norm") and transformer_encoder.layer_norm is not None:
-                encoder_states = transformer_encoder.layer_norm(encoder_states)
+            # All tokens real (no padding in single-sample inference)
+            enc_mask = torch.ones(
+                hidden_states.shape[:2], dtype=torch.long, device=self.device
+            )
+            enc_out = transformer_enc(
+                hidden_states=hidden_states,
+                attention_mask=enc_mask,
+                return_dict=True,
+            )
+            encoder_states = enc_out.last_hidden_state   # (1, S, 768)
 
-            # 4. Manual Autoregressive Decoding Loop
-            from transformers.modeling_outputs import BaseModelOutput
-            encoder_outputs = BaseModelOutput(last_hidden_state=encoder_states)
-
+            # ── 2. Autoregressive decoding loop ──────────────────────────── #
             config = self.speecht5_model.config
-            num_mel_bins = config.num_mel_bins
-            reduction_factor = config.reduction_factor
-            
-            # Start with zeros
-            decoder_input_values = torch.zeros((1, 1, num_mel_bins), device=self.device)
-            past_key_values = None
-            spectrogram = []
-            
-            # Heuristic for max length
-            max_steps = int(maxlenratio * encoder_states.shape[1] / reduction_factor)
-            
-            for _ in range(max_steps):
-                # Run the decoder prenet on all predicted sequence frames
-                # output_sequence: (1, T_mel, 80)
-                # decoder_input_values starts with zeros (1, 1, 80)
-                # We need to use the model's internal decoder wrapper correctly
-                
-                decoder_hidden_states = self.speecht5_model.speecht5.decoder.prenet(decoder_input_values, speaker_embedding)
-                
-                # Wrapped decoder forward
-                # We only need the last step if using cache
-                decoder_out = self.speecht5_model.speecht5.decoder.wrapped_decoder(
-                    hidden_states=decoder_hidden_states[:, -1:],
+            num_mel_bins     = config.num_mel_bins      # 80
+            reduction_factor = config.reduction_factor  # 2
+
+            enc_len   = encoder_states.shape[1]
+            min_steps = max(0, int(minlenratio * enc_len / reduction_factor))
+            max_steps = (
+                int(maxlenratio * enc_len / reduction_factor)
+                if maxlenratio > 0 else 1000
+            )
+            max_steps = max(max_steps, min_steps + 1, 1)
+
+            # Start with a single all-zero frame
+            dec_input = torch.zeros((1, 1, num_mel_bins), device=self.device)
+            past_kv  = None
+            frames   = []   # list of (1, reduction_factor, 80)
+
+            for step in range(max_steps):
+                dec_hidden = self.speecht5_model.speecht5.decoder.prenet(
+                    dec_input, speaker_embedding
+                )
+                dec_out = self.speecht5_model.speecht5.decoder.wrapped_decoder(
+                    hidden_states=dec_hidden[:, -1:],
                     attention_mask=None,
                     encoder_hidden_states=encoder_states,
                     encoder_attention_mask=None,
-                    past_key_values=past_key_values,
+                    past_key_values=past_kv,
                     use_cache=True,
                     return_dict=True,
                 )
-                
-                last_decoder_output = decoder_out.last_hidden_state.squeeze(1) # (1, 768)
-                past_key_values = decoder_out.past_key_values
-                
-                # Predict new mel spectrum
-                # feat_out produces (1, reduction_factor * 80)
-                spectrum = self.speecht5_model.speech_decoder_postnet.feat_out(last_decoder_output)
-                spectrum = spectrum.view(1, reduction_factor, num_mel_bins)
-                spectrogram.append(spectrum)
-                
-                # Next input frame
-                # Extract last frame for the next step's input
-                new_frame = spectrum[:, -1:, :] # (1, 1, 80)
-                decoder_input_values = torch.cat((decoder_input_values, new_frame), dim=1)
-                
-                # Check stop token
-                prob = torch.sigmoid(self.speecht5_model.speech_decoder_postnet.prob_out(last_decoder_output))
-                if prob.max() > threshold:
-                    break
+                last_h  = dec_out.last_hidden_state.squeeze(1)   # (1, 768)
+                past_kv = dec_out.past_key_values
 
-            # Process collected frames
-            if not spectrogram:
-                return np.zeros(16000)
-                
-            # Concatenate along time dimension
-            frames = torch.cat(spectrogram, dim=1).flatten(1, 2) # (1, T_total, 80)
-            # Apply postbatch (Tacotron style)
-            # Actually line 2390 says:
-            # spectrograms = model.speech_decoder_postnet.postnet(spectrograms)
-            
-            # spectrograms in _generate_speech is (Batch, T, 80) after transpose/flatten
-            # let's rebuild it similarly
-            # spectrogram is list of (1, 2, 80)
-            mel_out = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2) # (1, T, 80)
+                # (1, RF * 80) → (1, RF, 80)
+                spec = self.speecht5_model.speech_decoder_postnet.feat_out(last_h)
+                spec = spec.view(1, reduction_factor, num_mel_bins)
+                frames.append(spec)
+
+                dec_input = torch.cat([dec_input, spec[:, -1:, :]], dim=1)
+
+                # stop-token (honoured only after min_steps)
+                # prob_out returns (1, reduction_factor) — use .max() not .item()
+                if step >= min_steps:
+                    stop_p = torch.sigmoid(
+                        self.speecht5_model.speech_decoder_postnet.prob_out(last_h)
+                    )
+                    if stop_p.max() > threshold:
+                        break
+
+            # ── 3. Assemble mel, apply postnet, vocoder ───────────────────── #
+            if not frames:
+                return np.zeros(16000, dtype=np.float32)
+
+            # frames: list of (1, RF, 80)  →  (1, T, 80)
+            mel_out  = torch.cat(frames, dim=1)   # (1, N*RF, 80)
             mel_post = self.speecht5_model.speech_decoder_postnet.postnet(mel_out)
-            
-            # 5. Pass through vocoder
-            speech = self.vocoder(mel_post)
-            speech = speech.squeeze()
+            speech   = self.vocoder(mel_post).squeeze()
 
         return speech.cpu().numpy()
 
