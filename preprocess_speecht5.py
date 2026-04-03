@@ -207,24 +207,48 @@ def process_source_batch_wav2vec(batch):
     return {"audio": encoded_list}
 
 def process_target_batch(batch):
-    """Convert target audio to spectrograms."""
+    """
+    Convert target audio to SpeechT5-compatible 80-bin log-mel spectrograms.
+
+    The correct path is ``SpeechT5Processor(audio_target=audio)`` which
+    internally calls ``SpeechT5FeatureExtractor`` in *decoder* mode and
+    returns a properly normalised log-mel spectrogram of shape (Time, 80).
+
+    WRONG (previous bug)::
+        proc.feature_extractor(audio_arrays).input_values
+        # → raw, mean-var normalised waveform  shape=(N_samples,)  ❌
+
+    CORRECT::
+        proc(audio_target=audio, sampling_rate=16000).input_values
+        # → log-mel spectrogram  shape=(Time, 80)  ✅
+
+    SpeechT5 mel-spec settings (from microsoft/speecht5_vc):
+        num_mel_bins = 80, hop_length = 16, win_length = 64, n_fft = 1024,
+        sampling_rate = 16000, fmin = 80, fmax = 7600, reduction_factor = 2.
+    """
     proc = get_processor()
     if proc is None:
         raise RuntimeError("Processor failed to initialize")
-        
-    audio_arrays = [x["array"] for x in batch["audio"]]
-    
-    # FIX: Use feature_extractor directly to avoid 'labels' KeyError.
-    # The feature_extractor returns 'input_values' (Log-Mel Spectrograms).
-    # We explicitly request it to handle the batch.
-    out = proc.feature_extractor(
-        audio_arrays, 
-        sampling_rate=16000, 
-        return_attention_mask=False
-    )
-    
-    # The output key is always 'input_values' from the feature_extractor
-    return {"audio": out.input_values}
+
+    spectrograms = []
+    for audio_item in batch["audio"]:
+        audio_array = np.array(audio_item["array"], dtype=np.float32).flatten()
+        sr = audio_item.get("sampling_rate", 16000)
+
+        # Resample to 16 kHz if needed
+        if sr != 16000:
+            import librosa
+            audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+
+        # Use the *decoder* path of SpeechT5Processor:
+        #   proc(audio_target=audio, sampling_rate=16000)
+        # This returns input_values of shape (1, Time, 80).
+        out = proc(audio_target=audio_array, sampling_rate=16000)
+        # Squeeze batch dim → (Time, 80) numpy array
+        mel = np.array(out.input_values[0], dtype=np.float32)  # (Time, 80)
+        spectrograms.append(mel)
+
+    return {"audio": spectrograms}
 
 def preprocess_and_save():
     print(f"--- Preprocessing {SOURCE_LANG} -> {TARGET_LANG} with Multithreading ---")
@@ -468,7 +492,7 @@ def preprocess_and_save_wav2vec():
     # 5. Save to Disk
     out_path = os.path.join(
         OUTPUT_DIR,
-        f"processed_speecht5_wav2vec_{SOURCE_LANG}_{TARGET_LANG}_v1",
+        f"processed_speecht5_wav2vec_{SOURCE_LANG}_{TARGET_LANG}_v3",
     )
     print(f"Saving to {out_path}...")
     source_ds.save_to_disk(os.path.join(out_path, SOURCE_LANG))
