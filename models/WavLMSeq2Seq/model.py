@@ -6,6 +6,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import WavLMModel, Wav2Vec2Processor
 from tqdm import tqdm
 import math
+import signal
+import sys
 
 class WavLMSeq2SeqDataset(Dataset):
     def __init__(self, source_ds, target_ds):
@@ -137,6 +139,12 @@ class WavLMTranslator(nn.Module):
         self.eval()
         print(f"Model loaded from {path}")
 
+    def interrupt_handler(self, sig, frame):
+        """Handles manual interruption signal."""
+        print("\nInterruption detected! Saving checkpoint...")
+        self.save('interrupted_wavlm_checkpoint')
+        sys.exit(0)
+
     def train_model(self, loader, epochs=10, learning_rate=1e-4):
         self.train()
         optimizer = optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=learning_rate)
@@ -144,58 +152,70 @@ class WavLMTranslator(nn.Module):
         mse_loss_fn = nn.MSELoss()
         bce_loss_fn = nn.BCEWithLogitsLoss()
 
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}")
+        signal.signal(signal.SIGINT, self.interrupt_handler)
 
-            for input_audio, input_mask, target_audio, target_mask in pbar:
-                input_audio = input_audio.to(self.device).squeeze(1) if input_audio.dim() > 2 else input_audio.to(self.device)
-                input_mask = input_mask.to(self.device).squeeze(1) if input_mask.dim() > 2 else input_mask.to(self.device)
-                target_audio = target_audio.to(self.device).squeeze(1) if target_audio.dim() > 2 else target_audio.to(self.device)
-                target_mask = target_mask.to(self.device).squeeze(1) if target_mask.dim() > 2 else target_mask.to(self.device)
+        try:
+            for epoch in range(epochs):
+                self.current_epoch = epoch
+                epoch_loss = 0.0
+                pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}")
 
-                optimizer.zero_grad()
+                for input_audio, input_mask, target_audio, target_mask in pbar:
+                    input_audio = input_audio.to(self.device).squeeze(1) if input_audio.dim() > 2 else input_audio.to(self.device)
+                    input_mask = input_mask.to(self.device).squeeze(1) if input_mask.dim() > 2 else input_mask.to(self.device)
+                    target_audio = target_audio.to(self.device).squeeze(1) if target_audio.dim() > 2 else target_audio.to(self.device)
+                    target_mask = target_mask.to(self.device).squeeze(1) if target_mask.dim() > 2 else target_mask.to(self.device)
+
+                    optimizer.zero_grad()
+                    
+                    try:
+                        # Target audio must be normalized
+                        input_inputs = self.processor(input_audio.cpu().numpy(), sampling_rate=16000, return_tensors='pt', padding=True)
+                        target_inputs = self.processor(target_audio.cpu().numpy(), sampling_rate=16000, return_tensors='pt', padding=True)
+                        
+                        in_wav = input_inputs.input_values.to(self.device)
+                        in_mask = input_inputs.attention_mask.to(self.device)
+                        tgt_wav = target_inputs.input_values.to(self.device)
+                        tgt_mask = target_inputs.attention_mask.to(self.device)
+
+                        predicted_vectors, predicted_stop, target_vectors = self.forward(
+                            in_wav, in_mask, tgt_wav, tgt_mask
+                        )
+
+                        # For teacher forcing predicting the next frame, 
+                        # we should ideally shift the targets. 
+                        # pred: [0, T-1] should match target: [1, T]
+                        # Since we want to keep it simple, we compare identically length-aligned chunks
+                        # but shift inside the loss
+                        
+                        pred_vec = predicted_vectors[:, :-1, :]
+                        true_vec = target_vectors[:, 1:, :]
+                        
+                        loss_mse = mse_loss_fn(pred_vec, true_vec)
+                        
+                        # Stop token dummy loss (1 when it's the last frame)
+                        stop_targets = torch.zeros_like(predicted_stop)
+                        stop_targets[:, -1] = 1.0 # Only last frame is 1
+                        
+                        loss_stop = bce_loss_fn(predicted_stop, stop_targets)
+                        
+                        loss = loss_mse + loss_stop
+                        loss.backward()
+                        optimizer.step()
+
+                        epoch_loss += loss.item()
+                        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                    
+                    except Exception as e:
+                        print(f"Error processing batch: {e}")
+                        continue
                 
-                try:
-                    # Target audio must be normalized
-                    input_inputs = self.processor(input_audio.cpu().numpy(), sampling_rate=16000, return_tensors='pt', padding=True)
-                    target_inputs = self.processor(target_audio.cpu().numpy(), sampling_rate=16000, return_tensors='pt', padding=True)
-                    
-                    in_wav = input_inputs.input_values.to(self.device)
-                    in_mask = input_inputs.attention_mask.to(self.device)
-                    tgt_wav = target_inputs.input_values.to(self.device)
-                    tgt_mask = target_inputs.attention_mask.to(self.device)
+                print(f"Epoch {epoch+1} Completed. Avg Loss: {epoch_loss/len(loader):.4f}")
+        
+        except KeyboardInterrupt:
+            print(f"\nTraining interrupted by user. Saving checkpoint at epoch {getattr(self, 'current_epoch', 0) + 1}...")
+            self.save('interrupted_wavlm_checkpoint')
+            return self
 
-                    predicted_vectors, predicted_stop, target_vectors = self.forward(
-                        in_wav, in_mask, tgt_wav, tgt_mask
-                    )
-
-                    # For teacher forcing predicting the next frame, 
-                    # we should ideally shift the targets. 
-                    # pred: [0, T-1] should match target: [1, T]
-                    # Since we want to keep it simple, we compare identically length-aligned chunks
-                    # but shift inside the loss
-                    
-                    pred_vec = predicted_vectors[:, :-1, :]
-                    true_vec = target_vectors[:, 1:, :]
-                    
-                    loss_mse = mse_loss_fn(pred_vec, true_vec)
-                    
-                    # Stop token dummy loss (1 when it's the last frame)
-                    stop_targets = torch.zeros_like(predicted_stop)
-                    stop_targets[:, -1] = 1.0 # Only last frame is 1
-                    
-                    loss_stop = bce_loss_fn(predicted_stop, stop_targets)
-                    
-                    loss = loss_mse + loss_stop
-                    loss.backward()
-                    optimizer.step()
-
-                    epoch_loss += loss.item()
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
-                except Exception as e:
-                    print(f"Error processing batch: {e}")
-                    continue
-            
-            print(f"Epoch {epoch+1} Completed. Avg Loss: {epoch_loss/len(loader):.4f}")
+        print("Training finished.")
+        return self
