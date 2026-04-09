@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import librosa
 import numpy as np
-from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor, SpeechT5Processor, SpeechT5ForSpeechToSpeech, SpeechT5HifiGan
-
+from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor, SpeechT5Processor, SpeechT5ForSpeechToSpeech, SpeechT5HifiGan, WavLMModel
 
 class SpectrogramEncoder:
     def __init__(self, sample_rate=16000, n_mels=80, n_fft=1024, hop_length=256):
@@ -368,3 +367,128 @@ class SpeechT5MelSpectrogramEncoder(nn.Module):
 
 # Backwards-compatible alias so existing code that imports SpeechT5Encoder still works
 SpeechT5Encoder = SpeechT5MelSpectrogramEncoder
+
+class WavLMSpeechT5Encoder(nn.Module):
+    """
+    A WavLM-based encoder designed to be compatible with the SpeechT5 model.
+    Functions similarly to Wav2VecSpeechT5Encoder, but utilizes microsoft/wavlm-base-plus.
+    """
+
+    WAVLM_MODEL = "microsoft/wavlm-base-plus"
+    SPEECHT5_MODEL = "microsoft/speecht5_vc"
+    VOCODER_MODEL  = "microsoft/speecht5_hifigan"
+
+    def __init__(self, wavlm_model_name: str = WAVLM_MODEL, speecht5_model_name: str = SPEECHT5_MODEL, vocoder_model_name: str  = VOCODER_MODEL, load_decoder: bool = True):
+        super(WavLMSpeechT5Encoder, self).__init__()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        print(f"[WavLMSpeechT5Encoder] Loading Wav2Vec2 processor for '{wavlm_model_name}'...")
+        self.wavlm_processor = Wav2Vec2Processor.from_pretrained(wavlm_model_name)
+
+        print(f"[WavLMSpeechT5Encoder] Loading WavLM model from '{wavlm_model_name}'...")
+        self.wavlm_model = WavLMModel.from_pretrained(wavlm_model_name).to(self.device)
+
+        for param in self.wavlm_model.parameters():
+            param.requires_grad = False
+        self.wavlm_model.eval()
+
+        self.speecht5_model = None
+        self.vocoder = None
+
+        if load_decoder:
+            print(f"[WavLMSpeechT5Encoder] Loading SpeechT5 model from '{speecht5_model_name}'...")
+            self.speecht5_processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
+            self.speecht5_model = SpeechT5ForSpeechToSpeech.from_pretrained(speecht5_model_name).to(self.device)
+            self.speecht5_model.eval()
+
+            print(f"[WavLMSpeechT5Encoder] Loading HiFi-GAN vocoder from '{vocoder_model_name}'...")
+            self.vocoder = SpeechT5HifiGan.from_pretrained(vocoder_model_name).to(self.device)
+            self.vocoder.eval()
+
+    def encode(self, audio_array: np.ndarray, sr: int = 16000) -> torch.Tensor:
+        if audio_array.ndim > 1:
+            audio_array = audio_array.flatten()
+        inputs = self.wavlm_processor(audio_array, sampling_rate=sr, return_tensors="pt", padding=False)
+        input_values = inputs.input_values.to(self.device)
+        with torch.no_grad():
+            outputs = self.wavlm_model(input_values)
+        return outputs.last_hidden_state.cpu()
+
+    def encode_batch(self, audio_arrays: list, sr: int = 16000) -> list:
+        flat = [np.array(a, dtype=np.float32).flatten() for a in audio_arrays]
+        inputs = self.wavlm_processor(flat, sampling_rate=sr, return_tensors="pt", padding=True)
+        input_values  = inputs.input_values.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device) if hasattr(inputs, "attention_mask") else None
+        with torch.no_grad():
+            outputs = self.wavlm_model(input_values, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state.cpu()
+        result = []
+        for i in range(hidden_states.size(0)):
+            result.append(hidden_states[i].numpy())
+        return result
+
+    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor, threshold: float = 0.5, minlenratio: float = 0.0, maxlenratio: float = 2.0) -> np.ndarray:
+        if self.speecht5_model is None or self.vocoder is None:
+            raise RuntimeError("Decoder components were not loaded.")
+
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(0)
+        hidden_states = hidden_states.to(self.device)
+
+        if speaker_embedding.dim() == 1:
+            speaker_embedding = speaker_embedding.unsqueeze(0)
+        speaker_embedding = speaker_embedding.to(self.device)
+
+        with torch.no_grad():
+            encoder_obj = self.speecht5_model.speecht5.encoder
+            transformer_enc = encoder_obj.wrapped_encoder if hasattr(encoder_obj, "wrapped_encoder") else encoder_obj
+            enc_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=self.device)
+            enc_out = transformer_enc(hidden_states=hidden_states, attention_mask=enc_mask, return_dict=True)
+            encoder_states = enc_out.last_hidden_state
+
+            config = self.speecht5_model.config
+            num_mel_bins = config.num_mel_bins
+            reduction_factor = config.reduction_factor
+
+            enc_len = encoder_states.shape[1]
+            min_steps = max(0, int(minlenratio * enc_len / reduction_factor))
+            max_steps = int(maxlenratio * enc_len / reduction_factor) if maxlenratio > 0 else 1000
+            max_steps = max(max_steps, min_steps + 1, 1)
+
+            dec_input = torch.zeros((1, 1, num_mel_bins), device=self.device)
+            past_kv = None
+            frames = []
+
+            for step in range(max_steps):
+                dec_hidden = self.speecht5_model.speecht5.decoder.prenet(dec_input, speaker_embedding)
+                dec_out = self.speecht5_model.speecht5.decoder.wrapped_decoder(
+                    hidden_states=dec_hidden[:, -1:],
+                    attention_mask=None,
+                    encoder_hidden_states=encoder_states,
+                    encoder_attention_mask=None,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                last_h = dec_out.last_hidden_state.squeeze(1)
+                past_kv = dec_out.past_key_values
+
+                spec = self.speecht5_model.speech_decoder_postnet.feat_out(last_h)
+                spec = spec.view(1, reduction_factor, num_mel_bins)
+                frames.append(spec)
+
+                dec_input = torch.cat([dec_input, spec[:, -1:, :]], dim=1)
+
+                if step >= min_steps:
+                    stop_p = torch.sigmoid(self.speecht5_model.speech_decoder_postnet.prob_out(last_h))
+                    if stop_p.max() > threshold:
+                        break
+
+            if not frames:
+                return np.zeros(16000, dtype=np.float32)
+
+            mel_out = torch.cat(frames, dim=1)
+            mel_post = self.speecht5_model.speech_decoder_postnet.postnet(mel_out)
+            speech = self.vocoder(mel_post).squeeze()
+
+        return speech.cpu().numpy()
