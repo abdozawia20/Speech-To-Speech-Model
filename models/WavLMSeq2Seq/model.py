@@ -52,7 +52,7 @@ def wavlm_collate_fn(batch):
 
 
 class WavLMTranslator(nn.Module):
-    def __init__(self, encoder_name="microsoft/wavlm-base", d_model=768, num_decoder_layers=6):
+    def __init__(self, encoder_name="microsoft/wavlm-base-plus", d_model=768, num_decoder_layers=6):
         super(WavLMTranslator, self).__init__()
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
