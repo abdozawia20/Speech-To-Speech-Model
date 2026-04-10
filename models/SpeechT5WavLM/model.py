@@ -2,10 +2,13 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torchaudio
+
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: ["soundfile"]
 import numpy as np
 from transformers import (
     SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
-    WavLMModel, Wav2Vec2Processor
+    WavLMModel, Wav2Vec2Processor, Wav2Vec2FeatureExtractor
 )
 from transformers.modeling_outputs import BaseModelOutput
 from datasets import load_from_disk, load_dataset
@@ -18,10 +21,6 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import gc
 from speechbrain.inference.speaker import EncoderClassifier
-
-# Monkey-patch torchaudio for SpeechBrain compatibility
-if not hasattr(torchaudio, "list_audio_backends"):
-    torchaudio.list_audio_backends = lambda: ["soundfile"]
 
 
 class SpeechT5WavLMDataset(Dataset):
@@ -211,8 +210,8 @@ class SpeechT5WavLM(torch.nn.Module):
             emb = torch.randn((1, 512)).to(self.device)
 
         if not hasattr(self, '_wavlm_proc'):
-            print(f"Loading WavLM ({self.wavlm_model_name}) for inference...")
-            self._wavlm_proc  = Wav2Vec2Processor.from_pretrained(self.wavlm_model_name)
+            print(f"Loading WavLM ({self.wavlm_model_name}) extractor for inference...")
+            self._wavlm_proc  = Wav2Vec2FeatureExtractor.from_pretrained(self.wavlm_model_name)
             self._wavlm_model = WavLMModel.from_pretrained(self.wavlm_model_name).to(self.device).eval()
             for p in self._wavlm_model.parameters():
                 p.requires_grad_(False)
