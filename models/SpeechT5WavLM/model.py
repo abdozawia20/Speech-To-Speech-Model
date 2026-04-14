@@ -2,10 +2,20 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torchaudio
+
+# Monkey-patch torchaudio & os.symlink for SpeechBrain compatibility
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+import shutil
+# Fix WinError 1314 when downloading SpeechBrain models on Windows without Admin
+if hasattr(os, "symlink"):
+    os.symlink = lambda src, dst, *args, **kwargs: shutil.copy(src, dst)
+
 import numpy as np
 from transformers import (
-    SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
-    WavLMModel, Wav2Vec2Processor
+    SpeechT5ForSpeechToSpeech, SpeechT5Processor,
+    WavLMModel, Wav2Vec2FeatureExtractor
 )
 from transformers.modeling_outputs import BaseModelOutput
 from datasets import load_from_disk, load_dataset
@@ -16,13 +26,8 @@ import json
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-import gc
 from speechbrain.inference.speaker import EncoderClassifier
-
-# Monkey-patch torchaudio for SpeechBrain compatibility
-if not hasattr(torchaudio, "list_audio_backends"):
-    torchaudio.list_audio_backends = lambda: ["soundfile"]
-
+import gc
 
 class SpeechT5WavLMDataset(Dataset):
     def __init__(self, source_ds, target_ds, processor, speaker_embeddings, is_preprocessed=True):
@@ -132,15 +137,28 @@ class SpeechT5WavLM(torch.nn.Module):
         self.wavlm_model_name = wavlm_model_name
         print(f"Loading SpeechT5WavLM components (WavLM={wavlm_model_name})...")
         
-        self.processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
+        try:
+            self.processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
+        except TypeError:
+            print("Warning: SpeechT5Processor could not load the tokenizer. Bypassing as it is not needed for inference!")
+            self.processor = None
+            
         self.model = SpeechT5ForSpeechToSpeech.from_pretrained(speecht5_model_name)
-        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
         self.model.to(self.device)
-        self.vocoder.to(self.device)
+        
+        from speechbrain.inference.vocoders import HIFIGAN
+        print("Loading pre-trained German SpeechBrain Vocoder (padmalcom/tts-hifigan-german)...")
+        # Load the German SpeechBrain vocoder. We don't call .to(device) because run_opts handles it.
+        self.vocoder = HIFIGAN.from_hparams(
+            source="padmalcom/tts-hifigan-german", 
+            savedir="tmp_hifigan_de",
+            run_opts={"device": str(self.device)}
+        )
+
         self.target_embeddings = None
 
     def get_speaker_embedding(self, target_lang):
@@ -212,7 +230,7 @@ class SpeechT5WavLM(torch.nn.Module):
 
         if not hasattr(self, '_wavlm_proc'):
             print(f"Loading WavLM ({self.wavlm_model_name}) for inference...")
-            self._wavlm_proc  = Wav2Vec2Processor.from_pretrained(self.wavlm_model_name)
+            self._wavlm_proc  = Wav2Vec2FeatureExtractor.from_pretrained(self.wavlm_model_name)
             self._wavlm_model = WavLMModel.from_pretrained(self.wavlm_model_name).to(self.device).eval()
             for p in self._wavlm_model.parameters():
                 p.requires_grad_(False)
@@ -277,7 +295,9 @@ class SpeechT5WavLM(torch.nn.Module):
 
             mel = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)
             mel = self.model.speech_decoder_postnet.postnet(mel)
-            speech = self.vocoder(mel).squeeze()
+            # Use SpeechBrain's decode_batch (mel shape: 1, Total_Frames, 80 -> 1, 80, Total_Frames)
+            mel_transposed = mel.transpose(1, 2)
+            speech = self.vocoder.decode_batch(mel_transposed).squeeze()
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
@@ -400,7 +420,7 @@ class SpeechT5WavLM(torch.nn.Module):
     def save(self, path):
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))
-        self.vocoder.save_pretrained(os.path.join(path, "vocoder"))
+        # self.vocoder.save_pretrained(os.path.join(path, "vocoder")) # Skipped: SpeechBrain vocoder is pre-trained and fixed
         if self.target_embeddings is not None:
             np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
 
