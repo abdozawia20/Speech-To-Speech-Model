@@ -186,6 +186,24 @@ class SpeechT5WavLM(torch.nn.Module):
         return encoder_obj
 
     def _encode_wavlm_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> BaseModelOutput:
+        # Normalize WavLM features (SpeechT5 expects normalized features here)
+        hidden_states = torch.nn.functional.layer_norm(hidden_states, [hidden_states.shape[-1]])
+
+        prenet = self.model.speecht5.encoder.prenet
+
+        # Add positional convolutional embedding
+        positional_conv_embedding = prenet.pos_conv_embed(hidden_states)
+        hidden_states = hidden_states + positional_conv_embedding
+
+        # Add positional sinusoidal embedding
+        if attention_mask is not None:
+            padding_mask = attention_mask.ne(1).long()
+        else:
+            padding_mask = torch.zeros(hidden_states.shape[:2], dtype=torch.long, device=hidden_states.device)
+
+        positional_sinusoidal_embeddings = prenet.pos_sinusoidal_embed(padding_mask)
+        hidden_states = hidden_states + positional_sinusoidal_embeddings
+
         transformer_enc = self._get_speecht5_transformer_encoder()
         return transformer_enc(
             hidden_states=hidden_states,
@@ -269,7 +287,7 @@ class SpeechT5WavLM(torch.nn.Module):
                 return {'audio': {'array': np.zeros(16000, dtype=np.float32), 'sampling_rate': 16000}}
 
             mel = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)
-            mel = self.model.speech_decoder_postnet.postnet(mel)
+            mel = mel + self.model.speech_decoder_postnet.postnet(mel)
             speech = self.vocoder(mel).squeeze()
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
