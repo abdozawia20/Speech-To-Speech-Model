@@ -6,6 +6,7 @@ import torchaudio
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 import numpy as np
+from transformers import get_linear_schedule_with_warmup
 from transformers import (
     SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
     WavLMModel, Wav2Vec2Processor, Wav2Vec2FeatureExtractor
@@ -321,7 +322,7 @@ class SpeechT5WavLM(torch.nn.Module):
         from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
 
         print("Starting WavLM+SpeechT5 fine-tuning (Hybrid Architecture).")
-        GRAD_ACCUM_STEPS = 8
+        GRAD_ACCUM_STEPS = 4
 
         # ------------------------------------------------------------------
         # 1. Load the unified paired dataset
@@ -392,7 +393,19 @@ class SpeechT5WavLM(torch.nn.Module):
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=learning_rate,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        
+        # Calculate total optimization steps (accounting for gradient accumulation)
+        total_steps = len(train_loader) * epochs // GRAD_ACCUM_STEPS
+
+        # Set warmup to 10% of total training steps
+        warmup_steps = int(total_steps * 0.1)
+
+        # Initialize the new scheduler
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, 
+            num_warmup_steps=warmup_steps, 
+            num_training_steps=total_steps
+        )
 
         # L1 + MSE combined loss (element-wise, ignores padding frames)
         l1_criterion  = torch.nn.L1Loss(reduction="mean")
@@ -486,6 +499,7 @@ class SpeechT5WavLM(torch.nn.Module):
                     if (step + 1) % GRAD_ACCUM_STEPS == 0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         optimizer.step()
+                        scheduler.step() # <--- ADDED HERE
                         optimizer.zero_grad()
 
                     current_loss = loss.item()
@@ -500,7 +514,6 @@ class SpeechT5WavLM(torch.nn.Module):
                     if step % 50 == 0:
                         torch.cuda.empty_cache()
 
-                scheduler.step()
                 avg_loss = epoch_loss / max(num_batches, 1)
                 print(f"Epoch {epoch+1}/{epochs}  Avg Loss: {avg_loss:.4f}")
                 if (epoch + 1) % 5 == 0:
