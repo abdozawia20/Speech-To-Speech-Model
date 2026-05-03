@@ -649,25 +649,6 @@ class SpeechT5(torch.nn.Module):
         processor_path = os.path.join(path, "processor")
         vocoder_path = os.path.join(path, "vocoder")
 
-        # --- DIAGNOSTIC: print exactly what the container sees ---
-        print(f"[LOAD] Resolved checkpoint root : {os.path.abspath(path)}")
-        print(f"[LOAD] model_path exists        : {os.path.exists(model_path)}")
-        print(f"[LOAD] model_path files         : {os.listdir(model_path) if os.path.exists(model_path) else 'MISSING'}")
-        print(f"[LOAD] vocoder_path exists      : {os.path.exists(vocoder_path)}")
-        print(f"[LOAD] vocoder_path files       : {os.listdir(vocoder_path) if os.path.exists(vocoder_path) else 'MISSING'}")
-        # --- END DIAGNOSTIC ---
-
-        # Guard: refuse to fall back to HuggingFace if local weights are missing
-        weight_files = ["model.safetensors", "pytorch_model.bin", "adapter_config.json"]
-        if not os.path.exists(model_path) or not any(
-            os.path.exists(os.path.join(model_path, w)) for w in weight_files
-        ):
-            raise FileNotFoundError(
-                f"[LOAD] No weight files found in '{model_path}'. "
-                f"Expected one of {weight_files}. "
-                "The fine-tuned checkpoint was not baked into the Docker image correctly."
-            )
-
         if os.path.exists(os.path.join(model_path, "adapter_config.json")):
             print("[LOAD] Branch: LoRA adapter")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
