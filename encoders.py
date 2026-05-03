@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import librosa
 import numpy as np
-from transformers import Wav2Vec2Processor, Wav2Vec2Model, EncodecModel, AutoProcessor, SpeechT5Processor, SpeechT5ForSpeechToSpeech, SpeechT5HifiGan, WavLMModel
+from transformers import Wav2Vec2Processor, Wav2Vec2FeatureExtractor, Wav2Vec2Model, EncodecModel, AutoProcessor, SpeechT5Processor, SpeechT5ForSpeechToSpeech, SpeechT5HifiGan, WavLMModel
 
 class SpectrogramEncoder:
     def __init__(self, sample_rate=16000, n_mels=80, n_fft=1024, hop_length=256):
@@ -382,8 +382,8 @@ class WavLMSpeechT5Encoder(nn.Module):
         super(WavLMSpeechT5Encoder, self).__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print(f"[WavLMSpeechT5Encoder] Loading Wav2Vec2 processor for '{wavlm_model_name}'...")
-        self.wavlm_processor = Wav2Vec2Processor.from_pretrained(wavlm_model_name)
+        print(f"[WavLMSpeechT5Encoder] Loading Wav2Vec2FeatureExtractor for '{wavlm_model_name}'...")
+        self.wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained(wavlm_model_name)
 
         print(f"[WavLMSpeechT5Encoder] Loading WavLM model from '{wavlm_model_name}'...")
         self.wavlm_model = WavLMModel.from_pretrained(wavlm_model_name).to(self.device)

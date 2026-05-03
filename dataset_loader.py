@@ -10,7 +10,7 @@ import soundfile as sf
 project_root = os.path.abspath(os.path.join(os.getcwd(), ''))
 sys.path.append(project_root)
 
-NUM_PROC = os.cpu_count() or 4
+NUM_PROC = 4
 
 
 def transform_internal(batch):
