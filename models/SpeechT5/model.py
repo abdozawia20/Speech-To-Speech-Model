@@ -30,6 +30,18 @@ SUPPORTED_ENCODER_TYPES = ('default', 'wav2vec')
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 
+# Monkey-patch torch.amp.custom_fwd for SpeechBrain 1.1.0 compatibility with PyTorch 2.1.2 on CPU
+if not hasattr(torch.amp, "custom_fwd"):
+    if hasattr(torch.cuda.amp, "custom_fwd"):
+        def _custom_fwd_patch(fwd=None, **kwargs):
+            # SpeechBrain 1.1.0 passes device_type, but older torch doesn't support it
+            kwargs.pop("device_type", None)
+            return torch.cuda.amp.custom_fwd(fwd, **kwargs)
+        torch.amp.custom_fwd = _custom_fwd_patch
+    else:
+        # Fallback for older torch versions or edge cases
+        torch.amp.custom_fwd = lambda fwd=None, **kwargs: fwd if fwd is not None else lambda f: f
+
 from speechbrain.inference.speaker import EncoderClassifier
 
 class SpeechT5Dataset(Dataset):
@@ -426,27 +438,56 @@ class SpeechT5(torch.nn.Module):
 
     # ---------------------------------------------------------------------- #
 
-    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate):
+    def fine_tune(self, source_lang, target_lang, batch_size, epochs, learning_rate,
+                  dataset_dir: str = None):
+        """
+        Args:
+            source_lang:  BCP-47 source language code, e.g. ``'en'``.
+            target_lang:  BCP-47 target language code, e.g. ``'de'`` or ``'es'``.
+            batch_size:   Samples per gradient-accumulation micro-step.
+            epochs:       Number of full passes over the training data.
+            learning_rate: AdamW learning rate.
+            dataset_dir:  Optional absolute (or relative-to-CWD) path to a
+                          preprocessed dataset directory.  The directory must
+                          contain two sub-folders named after the language codes
+                          (e.g. ``en/`` and ``es/``), each loadable by
+                          ``datasets.load_from_disk``.
+
+                          When omitted the conventional naming scheme is used::
+
+                              # encoder_type='wav2vec'
+                              datasets/processed_speecht5_wav2vec_{src}_{tgt}_v3/
+                              # encoder_type='default'
+                              datasets/processed_speecht5_{src}_{tgt}_v2_cleaned/
+        """
         print(f"Starting fine-tuning: {source_lang} -> {target_lang}  "
               f"[encoder_type='{self.encoder_type}']")
 
         # --- CONFIGURATION ---
         GRAD_ACCUM_STEPS = 8  # Simulate larger batch size
 
-        # 1. Load Preprocessed Datasets
-        # Each encoder_type has its own preprocessed dataset directory.
-        if self.encoder_type == 'wav2vec':
-            candidate_paths = [
-                os.path.join(dataset_loader.DATASETS_DIR,
-                             f"processed_speecht5_wav2vec_{source_lang}_{target_lang}_v3"),
-            ]
-        else:  # 'default' aka MelSpectrogram
-            candidate_paths = [
-                os.path.join(dataset_loader.DATASETS_DIR,
-                             f"processed_speecht5_{source_lang}_{target_lang}_v2_cleaned"),
-            ]
-
-        preprocessed_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+        # 1. Resolve Preprocessed Dataset Directory
+        if dataset_dir is not None:
+            # Caller supplied an explicit path — use it directly.
+            preprocessed_path = os.path.abspath(dataset_dir)
+            if not os.path.exists(preprocessed_path):
+                raise FileNotFoundError(
+                    f"dataset_dir does not exist: '{preprocessed_path}'"
+                )
+            print(f"Using user-supplied dataset directory: {preprocessed_path}")
+        else:
+            # Fall back to the conventional naming scheme.
+            if self.encoder_type == 'wav2vec':
+                candidate_paths = [
+                    os.path.join(dataset_loader.DATASETS_DIR,
+                                 f"processed_speecht5_wav2vec_{source_lang}_{target_lang}_v3"),
+                ]
+            else:  # 'default' aka MelSpectrogram
+                candidate_paths = [
+                    os.path.join(dataset_loader.DATASETS_DIR,
+                                 f"processed_speecht5_{source_lang}_{target_lang}_v2_cleaned"),
+                ]
+            preprocessed_path = next((p for p in candidate_paths if os.path.exists(p)), None)
 
         if preprocessed_path:
             print(f"Loading preprocessed data from {preprocessed_path}...")
@@ -605,18 +646,50 @@ class SpeechT5(torch.nn.Module):
 
     def load(self, path):
         model_path = os.path.join(path, "model")
+        processor_path = os.path.join(path, "processor")
+        vocoder_path = os.path.join(path, "vocoder")
+
+        # --- DIAGNOSTIC: print exactly what the container sees ---
+        print(f"[LOAD] Resolved checkpoint root : {os.path.abspath(path)}")
+        print(f"[LOAD] model_path exists        : {os.path.exists(model_path)}")
+        print(f"[LOAD] model_path files         : {os.listdir(model_path) if os.path.exists(model_path) else 'MISSING'}")
+        print(f"[LOAD] vocoder_path exists      : {os.path.exists(vocoder_path)}")
+        print(f"[LOAD] vocoder_path files       : {os.listdir(vocoder_path) if os.path.exists(vocoder_path) else 'MISSING'}")
+        # --- END DIAGNOSTIC ---
+
+        # Guard: refuse to fall back to HuggingFace if local weights are missing
+        weight_files = ["model.safetensors", "pytorch_model.bin", "adapter_config.json"]
+        if not os.path.exists(model_path) or not any(
+            os.path.exists(os.path.join(model_path, w)) for w in weight_files
+        ):
+            raise FileNotFoundError(
+                f"[LOAD] No weight files found in '{model_path}'. "
+                f"Expected one of {weight_files}. "
+                "The fine-tuned checkpoint was not baked into the Docker image correctly."
+            )
+
         if os.path.exists(os.path.join(model_path, "adapter_config.json")):
-            print("Loading LoRA model...")
+            print("[LOAD] Branch: LoRA adapter")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
             self.model = PeftModel.from_pretrained(self.model, model_path)
         else:
-            print("Loading base model...")
-            self.model = SpeechT5ForSpeechToSpeech.from_pretrained(model_path)
+            print(f"[LOAD] Branch: full fine-tuned model from {model_path}")
+            self.model = SpeechT5ForSpeechToSpeech.from_pretrained(model_path, local_files_only=True)
         
+        if os.path.exists(processor_path):
+            print(f"[LOAD] Loading processor from {processor_path}...")
+            self.processor = SpeechT5Processor.from_pretrained(processor_path, local_files_only=True)
+        
+        if os.path.exists(vocoder_path):
+            print(f"[LOAD] Loading vocoder from {vocoder_path}...")
+            self.vocoder = SpeechT5HifiGan.from_pretrained(vocoder_path, local_files_only=True)
+
         self.model.to(self.device)
+        self.vocoder.to(self.device)
         self.model.eval()
         
         # Try load embedding
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
+            print(f"[LOAD] Loading speaker embedding from {emb_path}...")
             self.target_embeddings = torch.tensor(np.load(emb_path))

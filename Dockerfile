@@ -1,5 +1,5 @@
 # 1. Start with an official PyTorch image loaded with CUDA (GPU support)
-FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 # 2. Prevent interactive prompts from blocking the build (e.g., asking for timezones)
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,21 +22,6 @@ COPY requirements.txt .
 # 6. Install your specific Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 7. Copy your actual project code into the container
-COPY . .
-
-# 8. Choose which model pipeline to run.
-# Uncomment the CMD for the model you want to execute when the container starts.
-# Alternatively, you can override this safely using `docker run ... python path/to/script.py`
-
-# --- Baseline (Cascaded ASR -> MT -> TTS) ---
-CMD ["python", "models/ASR_MT_TTS/analysis_pipeline.py"]
-
-# --- SpeechT5 Model ---
-# CMD ["python", "models/SpeechT5/evaluate_speecht5.py"]
-
-# --- UNet Model ---
-# CMD ["python", "models/UNet/model.py"]
-
-# To build this container image, run:
-# docker build -t speech-to-speech:latest .
+# 7. Copy the models folder and all files in the root directory (excluding other folders)
+COPY *.py *.txt *.yml *.md ./
+COPY models/ ./models/
