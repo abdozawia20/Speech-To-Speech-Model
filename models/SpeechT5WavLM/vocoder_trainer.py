@@ -184,6 +184,10 @@ class SpeechT5VocoderDataset(Dataset):
     """
     def __init__(self, ds_path, speaker_embeddings, max_wav_value=32768.0):
         self.ds = load_from_disk(ds_path)
+        
+        # --- THE FIX: Force zero-copy PyTorch tensors ---
+        self.ds.set_format(type="torch", columns=["predicted_mel", "labels", "target_waveform"])
+        
         self.speaker_embeddings = speaker_embeddings
         self.max_wav_value = max_wav_value
 
@@ -193,30 +197,29 @@ class SpeechT5VocoderDataset(Dataset):
     def __getitem__(self, idx):
         row = self.ds[int(idx)]
 
-        # Cached predicted mel from SpeechT5 (pre-computed)
-        pred_val = np.array(row["predicted_mel"], dtype=np.float32)
-        if pred_val.ndim == 1:
-            pred_val = pred_val.reshape(-1, 80)
-        predicted_mel = torch.tensor(pred_val, dtype=torch.float32)
+        # Because of set_format("torch"), these are ALREADY PyTorch tensors!
+        # No more slow CPU np.array() conversions.
+        predicted_mel = row["predicted_mel"].float()
+        target_features = row["labels"].float()
+        waveform = row["target_waveform"].float().unsqueeze(0) # (1, T)
 
-        # Target Mel
-        tgt_val = np.array(row["labels"], dtype=np.float32)
-        if tgt_val.ndim == 1:
-            if tgt_val.size % 80 == 0:
-                tgt_val = tgt_val.reshape(-1, 80)
-        elif tgt_val.ndim == 3:
-            tgt_val = tgt_val.squeeze(0)
+        # -------------------------------------------------------------
+        # Keep your existing shape alignment logic just in case:
+        # -------------------------------------------------------------
+        if predicted_mel.ndim == 1:
+            predicted_mel = predicted_mel.reshape(-1, 80)
 
-        target_features = torch.tensor(tgt_val, dtype=torch.float32)
+        if target_features.ndim == 1:
+            if target_features.numel() % 80 == 0:
+                target_features = target_features.reshape(-1, 80)
+        elif target_features.ndim == 3:
+            target_features = target_features.squeeze(0)
+
         if target_features.shape[0] == 80 and target_features.shape[1] != 80:
             target_features = target_features.transpose(0, 1)
 
         if target_features.shape[0] % 2 != 0:
             target_features = target_features[:-1, :]
-
-        # Target Waveform
-        wav_val = np.array(row["target_waveform"], dtype=np.float32)
-        waveform = torch.tensor(wav_val, dtype=torch.float32).unsqueeze(0) # (1, T)
 
         return {
             "predicted_mel": predicted_mel,
