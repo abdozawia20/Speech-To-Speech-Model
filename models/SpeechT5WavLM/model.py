@@ -535,7 +535,7 @@ class SpeechT5WavLM(torch.nn.Module):
         Fine-tune ONLY the HiFi-GAN vocoder using adversarial training.
         The SpeechT5 transformer and WavLM backbone are explicitly frozen.
         """
-        from .vocoder_trainer import VocoderTrainer
+        from models.SpeechT5WavLM.vocoder_trainer import VocoderTrainer
         
         print("Starting Vocoder Fine-Tuning...")
 
@@ -558,7 +558,6 @@ class SpeechT5WavLM(torch.nn.Module):
         
         try:
             trainer.train(preprocessed_path, epochs, learning_rate, batch_size)
-            self.save("speecht5_wavlm_vocoder_fine_tuned")
         except KeyboardInterrupt:
             print("\nTraining interrupted! Saving current progress...")
             self.save("speecht5_wavlm_vocoder_interrupted")
