@@ -332,11 +332,13 @@ class VocoderTrainer:
                 optim_g.zero_grad()
 
                 # L1 Mel-Spectrogram Loss
-                labels_clean = labels[:, :predicted_mel.shape[1], :].clone()
+                min_mel_len = min(predicted_mel_clean.shape[1], labels.shape[1])
+                predicted_mel_clean_loss = predicted_mel_clean[:, :min_mel_len, :]
+                labels_clean = labels[:, :min_mel_len, :].clone()
                 labels_clean[labels_clean == -100.0] = 0.0
                 
                 # Compare the precomputed predicted mel against target mel
-                mel_loss = l1_criterion(predicted_mel_clean, labels_clean)
+                mel_loss = l1_criterion(predicted_mel_clean_loss, labels_clean)
 
                 # Adversarial Loss
                 _, y_d_gs, fmap_rs, fmap_gs = self.mpd(y, y_hat)
