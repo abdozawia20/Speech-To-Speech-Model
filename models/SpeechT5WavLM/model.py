@@ -530,6 +530,46 @@ class SpeechT5WavLM(torch.nn.Module):
             self.save("speecht5_wavlm_error_mid_train")
             print("Saved to 'speecht5_wavlm_error_mid_train'. Exiting safely.")
 
+    def fine_tune_vocoder(self, preprocessed_path, epochs, learning_rate, batch_size):
+        """
+        Fine-tune ONLY the HiFi-GAN vocoder using adversarial training.
+        The SpeechT5 transformer and WavLM backbone are explicitly frozen.
+        """
+        from .vocoder_trainer import VocoderTrainer
+        
+        print("Starting Vocoder Fine-Tuning...")
+
+        # 1. Freeze transformer and WavLM
+        print("Freezing SpeechT5 transformer and WavLM backbone...")
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        
+        if hasattr(self, '_wavlm_model'):
+            for p in self._wavlm_model.parameters():
+                p.requires_grad_(False)
+        
+        # 2. Delegate to Trainer
+        trainer = VocoderTrainer(
+            model=self.model,
+            vocoder=self.vocoder,
+            device=self.device,
+            target_embeddings=self.target_embeddings
+        )
+        
+        try:
+            trainer.train(preprocessed_path, epochs, learning_rate, batch_size)
+            self.save("speecht5_wavlm_vocoder_fine_tuned")
+        except KeyboardInterrupt:
+            print("\nTraining interrupted! Saving current progress...")
+            self.save("speecht5_wavlm_vocoder_interrupted")
+            print("Saved to 'speecht5_wavlm_vocoder_interrupted'. Exiting safely.")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error during vocoder training: {e}")
+            self.save("speecht5_wavlm_vocoder_error")
+            print("Saved to 'speecht5_wavlm_vocoder_error'. Exiting safely.")
+
     def save(self, path):
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))

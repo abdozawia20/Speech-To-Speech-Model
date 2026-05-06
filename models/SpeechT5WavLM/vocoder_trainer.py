@@ -1,0 +1,407 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import weight_norm, spectral_norm
+from torch.utils.data import Dataset, DataLoader
+from datasets import load_from_disk
+import numpy as np
+from tqdm import tqdm
+from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
+
+# =============================================================================
+# Discriminator Architectures (HiFi-GAN)
+# =============================================================================
+
+LRELU_SLOPE = 0.1
+
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size * dilation - dilation) / 2)
+
+class DiscriminatorP(torch.nn.Module):
+    """Period Discriminator for HiFi-GAN."""
+    def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
+        super(DiscriminatorP, self).__init__()
+        self.period = period
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
+        
+        self.convs = nn.ModuleList([
+            norm_f(nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(nn.Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(nn.Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(nn.Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(get_padding(kernel_size, 1), 0))),
+            norm_f(nn.Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(2, 0))),
+        ])
+        self.conv_post = norm_f(nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
+
+    def forward(self, x):
+        fmap = []
+        
+        # 1d to 2d
+        b, c, t = x.shape
+        if t % self.period != 0:
+            n_pad = self.period - (t % self.period)
+            x = F.pad(x, (0, n_pad), "reflect")
+            t = t + n_pad
+        x = x.view(b, c, t // self.period, self.period)
+
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, LRELU_SLOPE)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        
+        return x, fmap
+
+class MultiPeriodDiscriminator(torch.nn.Module):
+    def __init__(self):
+        super(MultiPeriodDiscriminator, self).__init__()
+        self.discriminators = nn.ModuleList([
+            DiscriminatorP(2),
+            DiscriminatorP(3),
+            DiscriminatorP(5),
+            DiscriminatorP(7),
+            DiscriminatorP(11),
+        ])
+
+    def forward(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+        for i, d in enumerate(self.discriminators):
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+class DiscriminatorS(torch.nn.Module):
+    """Scale Discriminator for HiFi-GAN."""
+    def __init__(self, use_spectral_norm=False):
+        super(DiscriminatorS, self).__init__()
+        norm_f = weight_norm if not use_spectral_norm else spectral_norm
+        
+        self.convs = nn.ModuleList([
+            norm_f(nn.Conv1d(1, 128, 15, 1, padding=7)),
+            norm_f(nn.Conv1d(128, 128, 41, 2, groups=4, padding=20)),
+            norm_f(nn.Conv1d(128, 256, 41, 2, groups=16, padding=20)),
+            norm_f(nn.Conv1d(256, 512, 41, 4, groups=16, padding=20)),
+            norm_f(nn.Conv1d(512, 1024, 41, 4, groups=16, padding=20)),
+            norm_f(nn.Conv1d(1024, 1024, 41, 1, groups=16, padding=20)),
+            norm_f(nn.Conv1d(1024, 1024, 5, 1, padding=2)),
+        ])
+        self.conv_post = norm_f(nn.Conv1d(1024, 1, 3, 1, padding=1))
+
+    def forward(self, x):
+        fmap = []
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, LRELU_SLOPE)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+
+        return x, fmap
+
+class MultiScaleDiscriminator(torch.nn.Module):
+    def __init__(self):
+        super(MultiScaleDiscriminator, self).__init__()
+        self.discriminators = nn.ModuleList([
+            DiscriminatorS(use_spectral_norm=True),
+            DiscriminatorS(),
+            DiscriminatorS(),
+        ])
+        self.meanpools = nn.ModuleList([
+            nn.AvgPool1d(4, 2, padding=2),
+            nn.AvgPool1d(4, 2, padding=2)
+        ])
+
+    def forward(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+        for i, d in enumerate(self.discriminators):
+            if i != 0:
+                y = self.meanpools[i-1](y)
+                y_hat = self.meanpools[i-1](y_hat)
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
+# =============================================================================
+# Discriminator Losses
+# =============================================================================
+
+def feature_loss(fmap_r, fmap_g):
+    loss = 0
+    for dr, dg in zip(fmap_r, fmap_g):
+        for rl, gl in zip(dr, dg):
+            loss += torch.mean(torch.abs(rl - gl))
+    return loss * 2
+
+def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    loss = 0
+    r_losses = []
+    g_losses = []
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        r_loss = torch.mean((1 - dr)**2)
+        g_loss = torch.mean(dg**2)
+        loss += (r_loss + g_loss)
+        r_losses.append(r_loss.item())
+        g_losses.append(g_loss.item())
+
+    return loss, r_losses, g_losses
+
+def generator_loss(disc_outputs):
+    loss = 0
+    gen_losses = []
+    for dg in disc_outputs:
+        l = torch.mean((1 - dg)**2)
+        gen_losses.append(l)
+        loss += l
+
+    return loss, gen_losses
+
+# =============================================================================
+# Dataset and Dataloader
+# =============================================================================
+
+class SpeechT5VocoderDataset(Dataset):
+    """
+    Dataset for HiFi-GAN Vocoder fine-tuning.
+    Reads: input_values (WavLM), labels (Mel), target_waveform (Audio).
+    """
+    def __init__(self, ds_path, speaker_embeddings, max_wav_value=32768.0):
+        self.ds = load_from_disk(ds_path)
+        self.speaker_embeddings = speaker_embeddings
+        self.max_wav_value = max_wav_value
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        row = self.ds[int(idx)]
+
+        # Source WavLM features
+        src_val = np.array(row["input_values"], dtype=np.float32)
+        if src_val.ndim == 1:
+            if src_val.size % 768 == 0:
+                src_val = src_val.reshape(-1, 768)
+        source_features = torch.tensor(src_val, dtype=torch.float32)
+
+        # Target Mel
+        tgt_val = np.array(row["labels"], dtype=np.float32)
+        if tgt_val.ndim == 1:
+            if tgt_val.size % 80 == 0:
+                tgt_val = tgt_val.reshape(-1, 80)
+        elif tgt_val.ndim == 3:
+            tgt_val = tgt_val.squeeze(0)
+
+        target_features = torch.tensor(tgt_val, dtype=torch.float32)
+        if target_features.shape[0] == 80 and target_features.shape[1] != 80:
+            target_features = target_features.transpose(0, 1)
+
+        if target_features.shape[0] % 2 != 0:
+            target_features = target_features[:-1, :]
+
+        # Target Waveform
+        wav_val = np.array(row["target_waveform"], dtype=np.float32)
+        waveform = torch.tensor(wav_val, dtype=torch.float32).unsqueeze(0) # (1, T)
+
+        return {
+            "input_values": source_features,
+            "labels": target_features,
+            "speaker_embeddings": self.speaker_embeddings,
+            "target_waveform": waveform
+        }
+
+def vocoder_collate_fn(batch):
+    input_values = [item["input_values"] for item in batch]
+    labels = [item["labels"] for item in batch]
+    speaker_embeddings = [item["speaker_embeddings"] for item in batch]
+    waveforms = [item["target_waveform"].squeeze(0) for item in batch]
+
+    input_values_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True)
+    labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100.0)
+    speaker_embeddings_stacked = torch.stack(speaker_embeddings)
+    
+    # Pad waveforms
+    waveforms_padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
+    waveforms_padded = waveforms_padded.unsqueeze(1) # (B, 1, T)
+
+    attention_mask = (input_values_padded.abs().sum(dim=-1) != 0).long()
+
+    return input_values_padded, attention_mask, labels_padded, speaker_embeddings_stacked, waveforms_padded
+
+# =============================================================================
+# Trainer
+# =============================================================================
+
+class VocoderTrainer:
+    def __init__(self, model, vocoder, device, target_embeddings):
+        self.model = model
+        self.vocoder = vocoder
+        self.device = device
+        self.target_embeddings = target_embeddings
+
+        self.mpd = MultiPeriodDiscriminator().to(device)
+        self.msd = MultiScaleDiscriminator().to(device)
+
+    def train(self, preprocessed_path, epochs, learning_rate, batch_size):
+        print("Initializing Vocoder Trainer...")
+        
+        # Datasets
+        train_dataset = SpeechT5VocoderDataset(preprocessed_path, self.target_embeddings)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=vocoder_collate_fn,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+        # Optimizers
+        optim_g = torch.optim.AdamW(self.vocoder.parameters(), lr=learning_rate, betas=(0.8, 0.99))
+        optim_d = torch.optim.AdamW(
+            list(self.mpd.parameters()) + list(self.msd.parameters()), 
+            lr=learning_rate, betas=(0.8, 0.99)
+        )
+
+        l1_criterion = torch.nn.L1Loss()
+
+        self.vocoder.train()
+        self.mpd.train()
+        self.msd.train()
+
+        # Ensure SpeechT5 is in eval mode and frozen
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        for epoch in range(epochs):
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            
+            for step, (input_values, attention_mask, labels, speaker_embeddings, target_waveform) in enumerate(pbar):
+                input_values = input_values.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                labels = labels.to(self.device)
+                speaker_embeddings = speaker_embeddings.to(self.device)
+                target_waveform = target_waveform.to(self.device)
+
+                # =================================================================
+                # 1. Forward pass through frozen SpeechT5
+                # =================================================================
+                with torch.no_grad():
+                    # Encode WavLM
+                    hidden_states = torch.nn.functional.layer_norm(input_values, [input_values.shape[-1]])
+                    prenet = self.model.speecht5.encoder.prenet
+                    pos_conv = prenet.pos_conv_embed(hidden_states)
+                    hidden_states = hidden_states + pos_conv
+                    
+                    padding_mask = attention_mask.ne(1).long()
+                    pos_sin = prenet.pos_sin_embed(padding_mask) if hasattr(prenet, "pos_sin_embed") else prenet.pos_sinusoidal_embed(padding_mask)
+                    hidden_states = hidden_states + pos_sin
+
+                    encoder_obj = self.model.speecht5.encoder
+                    if hasattr(encoder_obj, "wrapped_encoder"):
+                        encoder_obj = encoder_obj.wrapped_encoder
+                    
+                    encoder_out = encoder_obj(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                    )
+
+                    decoder_input_values, decoder_attention_mask = shift_spectrograms_right(
+                        labels, self.model.config.reduction_factor, None
+                    )
+
+                    outputs = self.model.speecht5(
+                        encoder_outputs=encoder_out,
+                        attention_mask=attention_mask,
+                        decoder_input_values=decoder_input_values,
+                        decoder_attention_mask=decoder_attention_mask,
+                        speaker_embeddings=speaker_embeddings,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+
+                    _, outputs_after_postnet, _ = self.model.speech_decoder_postnet(outputs.last_hidden_state)
+                    
+                    # Trim/Mask
+                    valid_mask = (labels != -100.0).any(dim=-1)
+                    T_tgt = labels.shape[1]
+                    predicted_mel = outputs_after_postnet[:, :T_tgt, :] # (B, T, 80)
+
+                # =================================================================
+                # 2. Generator (Vocoder) Forward
+                # =================================================================
+                # SpeechT5HifiGan expects (B, T, 80) and handles internal transpose
+                y_hat = self.vocoder(predicted_mel) # (B, T_wav)
+                if y_hat.ndim == 2:
+                    y_hat = y_hat.unsqueeze(1) # (B, 1, T_wav)
+                
+                # Match lengths of generated audio and target audio
+                min_len = min(y_hat.shape[-1], target_waveform.shape[-1])
+                y_hat = y_hat[:, :, :min_len]
+                y = target_waveform[:, :, :min_len]
+
+                # =================================================================
+                # 3. Train Discriminator
+                # =================================================================
+                optim_d.zero_grad()
+                
+                # MPD
+                y_d_rs, y_d_gs, _, _ = self.mpd(y, y_hat.detach())
+                loss_disc_f, _, _ = discriminator_loss(y_d_rs, y_d_gs)
+                
+                # MSD
+                y_ds_rs, y_ds_gs, _, _ = self.msd(y, y_hat.detach())
+                loss_disc_s, _, _ = discriminator_loss(y_ds_rs, y_ds_gs)
+                
+                loss_disc_all = loss_disc_f + loss_disc_s
+                loss_disc_all.backward()
+                optim_d.step()
+
+                # =================================================================
+                # 4. Train Generator
+                # =================================================================
+                optim_g.zero_grad()
+
+                # L1 Mel-Spectrogram Loss
+                # labels is (B, T, 80), predicted_mel is (B, T, 80)
+                mel_loss = l1_criterion(predicted_mel, labels[:, :predicted_mel.shape[1], :])
+
+                # Adversarial Loss
+                _, y_d_gs, fmap_rs, fmap_gs = self.mpd(y, y_hat)
+                loss_gen_f, _ = generator_loss(y_d_gs)
+                loss_fm_f = feature_loss(fmap_rs, fmap_gs)
+
+                _, y_ds_gs, fmap_rs_s, fmap_gs_s = self.msd(y, y_hat)
+                loss_gen_s, _ = generator_loss(y_ds_gs)
+                loss_fm_s = feature_loss(fmap_rs_s, fmap_gs_s)
+
+                loss_gen_all = loss_gen_f + loss_gen_s + loss_fm_f + loss_fm_s + 45.0 * mel_loss
+                loss_gen_all.backward()
+                optim_g.step()
+
+                # Update progress bar
+                pbar.set_postfix({
+                    "D_Loss": f"{loss_disc_all.item():.4f}",
+                    "G_Loss": f"{loss_gen_all.item():.4f}"
+                })
+
+        print("Vocoder fine-tuning complete!")
