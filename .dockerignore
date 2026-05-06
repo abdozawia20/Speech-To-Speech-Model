@@ -3,9 +3,7 @@
 .gitignore
 
 # Virtual environment
-venv/
-env/
-.env
+.venv/
 
 # Python cache
 __pycache__/
@@ -13,22 +11,19 @@ __pycache__/
 *$py.class
 *.so
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
 # Datasets and large weights (Consider passing these via volume mounts instead)
 datasets/
+piper/
+tmp_spkrec/
 *.zip
 *.tar
 *.gz
 *.onnx
 
-# IDEs and editors
-.vscode/
-.idea/
-*.swp
-*.swo
 
 # Other
 benchmarks/
 Notebooks/
+
+/memory
+/.claude

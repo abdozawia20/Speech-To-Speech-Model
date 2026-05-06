@@ -3,7 +3,7 @@ datasets==3.6.0
 torch
 librosa
 matplotlib
-transformers
+transformers==4.57.3
 numpy
 ipython
 vosk
@@ -12,6 +12,9 @@ sentencepiece
 soundfile
 hf_xet
 gTTS
-peft
+peft==0.10.0
 speechbrain
 scipy
+fastapi
+uvicorn[standard]
+python-multipart

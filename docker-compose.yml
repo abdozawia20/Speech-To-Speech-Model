@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+
+    # GPU support: requires native Docker Engine (not Docker Desktop).
+    # Commented out because Docker Desktop for Linux runs a VM that cannot
+    # directly access the host's NVIDIA drivers via the native toolkit.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
