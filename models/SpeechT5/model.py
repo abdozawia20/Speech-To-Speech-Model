@@ -134,26 +134,11 @@ class SpeechT5Dataset(Dataset):
             source_features = torch.tensor(src_val, dtype=torch.float32)
 
         if target_features is None:
-            # Generate Target Spectrogram
-            try:
-                # Force feature extractor
-                features = self.processor.feature_extractor(
-                    tgt_val, 
-                    sampling_rate=16000, 
-                    return_tensors="pt"
-                ).input_values[0]
-                
-                # Validation: Did it return raw audio?
-                if features.dim() == 1 and len(features) == len(tgt_val):
-                     raise ValueError("Processor returned raw audio")
-                
-                target_features = features
-            except:
-                # Librosa fallback
-                mel = librosa.feature.melspectrogram(y=tgt_val, sr=16000, n_fft=1024, hop_length=256, n_mels=80)
-                log_mel = librosa.power_to_db(mel, ref=np.max)
-                norm_mel = (log_mel + 40.0) / 20.0 
-                target_features = torch.tensor(norm_mel.T, dtype=torch.float32)
+            # Generate Target Spectrogram using the HF processor's audio_target
+            # argument so that the resulting log-mel matches the vocoder's
+            # expected 10 ms hop / 40 ms window — never use librosa here.
+            inputs = self.processor(audio_target=tgt_val, sampling_rate=16000, return_tensors="pt")
+            target_features = inputs.labels[0]  # (Time, 80) log-mel, native HifiGAN format
 
         # 4. Final Shape Validations
         # Ensure (Time, 80)
@@ -161,15 +146,15 @@ class SpeechT5Dataset(Dataset):
              if target_features.shape[0] == 80 and target_features.shape[1] != 80:
                   target_features = target_features.transpose(0, 1)
         elif target_features.dim() == 1:
-             # Last ditch effort for 1D tensors that slipped through
+             # Defensive: reshape flat tensors that slipped through
              if target_features.shape[0] % 80 == 0:
                   target_features = target_features.view(-1, 80)
              else:
-                  # Recalculate using librosa if we have the original val
-                  mel = librosa.feature.melspectrogram(y=tgt_val, sr=16000, n_fft=1024, hop_length=256, n_mels=80)
-                  log_mel = librosa.power_to_db(mel, ref=np.max)
-                  norm_mel = (log_mel + 40.0) / 20.0 
-                  target_features = torch.tensor(norm_mel.T, dtype=torch.float32)
+                  raise ValueError(
+                      f"target_features is 1-D with size {target_features.shape[0]} "
+                      "which is not divisible by 80. The audio_target path should "
+                      "never produce this — check that the processor is correct."
+                  )
 
         # Enforce reduction_factor=2 dimension requirement
         if target_features.shape[0] % 2 != 0:
@@ -232,6 +217,14 @@ class SpeechT5(torch.nn.Module):
         self.model.to(self.device)
         self.vocoder.to(self.device)
         self.target_embeddings = None
+
+        # Projection layer to bridge the Wav2Vec2 latent space into the
+        # SpeechT5 transformer encoder's expected input space.  Even though
+        # both are 768-D, they were pre-trained independently so a learned
+        # linear map is required to avoid representation collapse.
+        # Only meaningful for encoder_type='wav2vec', but kept unconditionally
+        # so that checkpoints always contain the key.
+        self.wav2vec_projection = torch.nn.Linear(768, 768).to(self.device)
 
     def get_speaker_embedding(self, target_lang):
         """
@@ -329,7 +322,8 @@ class SpeechT5(torch.nn.Module):
             attention_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=self.device)
 
             with torch.no_grad():
-                encoder_out = self._encode_wav2vec_states(hidden_states, attention_mask)
+                projected_states = self.wav2vec_projection(hidden_states)  # align latent spaces
+                encoder_out = self._encode_wav2vec_states(projected_states, attention_mask)
                 encoder_states = encoder_out.last_hidden_state  # (1, Seq, 768)
 
                 # Manual autoregressive decoding — mirrors encoders.py decode().
@@ -464,7 +458,7 @@ class SpeechT5(torch.nn.Module):
               f"[encoder_type='{self.encoder_type}']")
 
         # --- CONFIGURATION ---
-        GRAD_ACCUM_STEPS = 8  # Simulate larger batch size
+        GRAD_ACCUM_STEPS = 2  # Simulate larger batch size
 
         # 1. Resolve Preprocessed Dataset Directory
         if dataset_dir is not None:
@@ -559,11 +553,11 @@ class SpeechT5(torch.nn.Module):
 
                     if self.encoder_type == 'wav2vec':
                         # input_values: (Batch, Seq_Len, 768) — Wav2Vec2 hidden states.
-                        # Bypass SpeechT5's CNN prenet and inject directly into the
-                        # transformer encoder using its full forward() so that
-                        # LayerNorm, dropout and position_bias are applied.
+                        # Project into SpeechT5's latent space first so the transformer
+                        # encoder receives meaningful representations rather than noise.
+                        projected = self.wav2vec_projection(input_values)  # (B, T, 768)
                         encoder_out = self._encode_wav2vec_states(
-                            input_values, attention_mask
+                            projected, attention_mask
                         )
                         outputs = self.model.speecht5(
                             encoder_outputs=encoder_out,
