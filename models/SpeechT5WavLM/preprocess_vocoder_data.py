@@ -329,7 +329,12 @@ def generate_and_cache_predicted_mel(paired_ds_path, output_ds_path, model_path,
 
     # 3. Save new column to dataset
     print(f"Appending 'predicted_mel' to dataset and saving to {output_ds_path}...")
-    ds = ds.add_column("predicted_mel", predicted_mels)
+    from datasets import Dataset, concatenate_datasets
+    def mel_generator():
+        for mel in predicted_mels:
+            yield {"predicted_mel": mel}
+    mel_ds = Dataset.from_generator(mel_generator)
+    ds = concatenate_datasets([ds, mel_ds], axis=1)
     ds.save_to_disk(output_ds_path)
     print("Caching complete!")
 
