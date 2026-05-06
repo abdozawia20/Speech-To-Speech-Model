@@ -6,7 +6,6 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_from_disk
 import numpy as np
 from tqdm import tqdm
-from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
 
 # =============================================================================
 # Discriminator Architectures (HiFi-GAN)
@@ -181,7 +180,7 @@ def generator_loss(disc_outputs):
 class SpeechT5VocoderDataset(Dataset):
     """
     Dataset for HiFi-GAN Vocoder fine-tuning.
-    Reads: input_values (WavLM), labels (Mel), target_waveform (Audio).
+    Reads: predicted_mel (cached), labels (Mel), target_waveform (Audio).
     """
     def __init__(self, ds_path, speaker_embeddings, max_wav_value=32768.0):
         self.ds = load_from_disk(ds_path)
@@ -194,12 +193,11 @@ class SpeechT5VocoderDataset(Dataset):
     def __getitem__(self, idx):
         row = self.ds[int(idx)]
 
-        # Source WavLM features
-        src_val = np.array(row["input_values"], dtype=np.float32)
-        if src_val.ndim == 1:
-            if src_val.size % 768 == 0:
-                src_val = src_val.reshape(-1, 768)
-        source_features = torch.tensor(src_val, dtype=torch.float32)
+        # Cached predicted mel from SpeechT5 (pre-computed)
+        pred_val = np.array(row["predicted_mel"], dtype=np.float32)
+        if pred_val.ndim == 1:
+            pred_val = pred_val.reshape(-1, 80)
+        predicted_mel = torch.tensor(pred_val, dtype=torch.float32)
 
         # Target Mel
         tgt_val = np.array(row["labels"], dtype=np.float32)
@@ -221,29 +219,24 @@ class SpeechT5VocoderDataset(Dataset):
         waveform = torch.tensor(wav_val, dtype=torch.float32).unsqueeze(0) # (1, T)
 
         return {
-            "input_values": source_features,
+            "predicted_mel": predicted_mel,
             "labels": target_features,
-            "speaker_embeddings": self.speaker_embeddings,
             "target_waveform": waveform
         }
 
 def vocoder_collate_fn(batch):
-    input_values = [item["input_values"] for item in batch]
+    predicted_mels = [item["predicted_mel"] for item in batch]
     labels = [item["labels"] for item in batch]
-    speaker_embeddings = [item["speaker_embeddings"] for item in batch]
     waveforms = [item["target_waveform"].squeeze(0) for item in batch]
 
-    input_values_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True)
+    predicted_mels_padded = torch.nn.utils.rnn.pad_sequence(predicted_mels, batch_first=True, padding_value=-100.0)
     labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100.0)
-    speaker_embeddings_stacked = torch.stack(speaker_embeddings)
     
     # Pad waveforms
     waveforms_padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     waveforms_padded = waveforms_padded.unsqueeze(1) # (B, 1, T)
 
-    attention_mask = (input_values_padded.abs().sum(dim=-1) != 0).long()
-
-    return input_values_padded, attention_mask, labels_padded, speaker_embeddings_stacked, waveforms_padded
+    return predicted_mels_padded, labels_padded, waveforms_padded
 
 # =============================================================================
 # Trainer
@@ -251,7 +244,7 @@ def vocoder_collate_fn(batch):
 
 class VocoderTrainer:
     def __init__(self, model, vocoder, device, target_embeddings):
-        self.model = model
+        self.model = model  # Kept for compatibility but no longer used in training loop
         self.vocoder = vocoder
         self.device = device
         self.target_embeddings = target_embeddings
@@ -286,71 +279,28 @@ class VocoderTrainer:
         self.mpd.train()
         self.msd.train()
 
-        # Ensure SpeechT5 is in eval mode and frozen
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
-
         for epoch in range(epochs):
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
             
-            for step, (input_values, attention_mask, labels, speaker_embeddings, target_waveform) in enumerate(pbar):
-                input_values = input_values.to(self.device)
-                attention_mask = attention_mask.to(self.device)
+            for step, (predicted_mel, labels, target_waveform) in enumerate(pbar):
+                
+                predicted_mel = predicted_mel.to(self.device)
                 labels = labels.to(self.device)
-                speaker_embeddings = speaker_embeddings.to(self.device)
                 target_waveform = target_waveform.to(self.device)
 
                 # =================================================================
-                # 1. Forward pass through frozen SpeechT5
+                # 1. Forward pass through frozen SpeechT5 is completely REMOVED!
+                #    We replace it with zeroing out padded frames in the cached mel
                 # =================================================================
-                with torch.no_grad():
-                    # Encode WavLM
-                    hidden_states = torch.nn.functional.layer_norm(input_values, [input_values.shape[-1]])
-                    prenet = self.model.speecht5.encoder.prenet
-                    pos_conv = prenet.pos_conv_embed(hidden_states)
-                    hidden_states = hidden_states + pos_conv
-                    
-                    padding_mask = attention_mask.ne(1).long()
-                    pos_sin = prenet.pos_sin_embed(padding_mask) if hasattr(prenet, "pos_sin_embed") else prenet.pos_sinusoidal_embed(padding_mask)
-                    hidden_states = hidden_states + pos_sin
-
-                    encoder_obj = self.model.speecht5.encoder
-                    if hasattr(encoder_obj, "wrapped_encoder"):
-                        encoder_obj = encoder_obj.wrapped_encoder
-                    
-                    encoder_out = encoder_obj(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        return_dict=True,
-                    )
-
-                    decoder_input_values, decoder_attention_mask = shift_spectrograms_right(
-                        labels, self.model.config.reduction_factor, None
-                    )
-
-                    outputs = self.model.speecht5(
-                        encoder_outputs=encoder_out,
-                        attention_mask=attention_mask,
-                        decoder_input_values=decoder_input_values,
-                        decoder_attention_mask=decoder_attention_mask,
-                        speaker_embeddings=speaker_embeddings,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-
-                    _, outputs_after_postnet, _ = self.model.speech_decoder_postnet(outputs.last_hidden_state)
-                    
-                    # Trim/Mask
-                    valid_mask = (labels != -100.0).any(dim=-1)
-                    T_tgt = labels.shape[1]
-                    predicted_mel = outputs_after_postnet[:, :T_tgt, :] # (B, T, 80)
+                # Zero out the padding (-100.0) so it doesn't break the vocoder
+                predicted_mel_clean = predicted_mel.clone()
+                predicted_mel_clean[predicted_mel == -100.0] = 0.0
 
                 # =================================================================
                 # 2. Generator (Vocoder) Forward
                 # =================================================================
                 # SpeechT5HifiGan expects (B, T, 80) and handles internal transpose
-                y_hat = self.vocoder(predicted_mel) # (B, T_wav)
+                y_hat = self.vocoder(predicted_mel_clean) # (B, T_wav)
                 if y_hat.ndim == 2:
                     y_hat = y_hat.unsqueeze(1) # (B, 1, T_wav)
                 
@@ -382,8 +332,11 @@ class VocoderTrainer:
                 optim_g.zero_grad()
 
                 # L1 Mel-Spectrogram Loss
-                # labels is (B, T, 80), predicted_mel is (B, T, 80)
-                mel_loss = l1_criterion(predicted_mel, labels[:, :predicted_mel.shape[1], :])
+                labels_clean = labels[:, :predicted_mel.shape[1], :].clone()
+                labels_clean[labels_clean == -100.0] = 0.0
+                
+                # Compare the precomputed predicted mel against target mel
+                mel_loss = l1_criterion(predicted_mel_clean, labels_clean)
 
                 # Adversarial Loss
                 _, y_d_gs, fmap_rs, fmap_gs = self.mpd(y, y_hat)

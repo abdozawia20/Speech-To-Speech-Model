@@ -29,59 +29,9 @@ SPEECHT5_MODEL_NAME = "microsoft/speecht5_vc"
 # ---------------------------------------------------------------------------
 # Global state for worker processes
 # ---------------------------------------------------------------------------
-language_model = None          # Whisper language detector (language filter step)
 _wavlm_proc_cache = None       # Wav2Vec2FeatureExtractor for WavLM
 _wavlm_model_cache = None      # Frozen WavLMModel backbone
 _MEL_TRANSFORM = None
-
-# ---------------------------------------------------------------------------
-# Worker utilities — language detection
-# ---------------------------------------------------------------------------
-
-def compute_duration(batch):
-    """Calculate duration of audio clips in batch."""
-    durations = []
-    for x in batch["audio"]:
-        durations.append(len(x["array"]) / x["sampling_rate"])
-    return {"duration": durations}
-
-
-def check_language(batch, expected_lang):
-    """
-    Detect the language of each audio clip using faster-whisper and return
-    a boolean column 'is_valid_lang'.
-    """
-    global language_model
-
-    if language_model is None:
-        try:
-            print(f"Loading Whisper model in worker (PID: {os.getpid()})...")
-            language_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        except Exception as e:
-            print(f"Warning: Failed to load Whisper model in worker: {e}")
-            return {"is_valid_lang": [True] * len(batch["audio"])}
-
-    is_valid = []
-    for x in batch["audio"]:
-        audio = x["array"]
-        sr = x["sampling_rate"]
-
-        if sr != 16000:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-
-        try:
-            segments, info = language_model.transcribe(
-                audio,
-                beam_size=1,
-                language=None,
-                task="transcribe",
-            )
-            is_valid.append(info.language == expected_lang)
-        except Exception:
-            is_valid.append(True)  # keep on transcription error
-
-    return {"is_valid_lang": is_valid}
 
 
 # ---------------------------------------------------------------------------
@@ -242,53 +192,6 @@ def preprocess_vocoder_data(num_samples=None):
     target_ds = target_ds.select(range(min_len))
     print(f"Initial aligned pairs: {min_len}")
 
-    # 2. Filter by Duration
-    print("Calculating durations...")
-    source_ds = source_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Source Durations")
-    target_ds = target_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Target Durations")
-
-    print(f"Filtering samples > {MAX_DURATION_SECONDS}s...")
-    src_durs = np.array(source_ds["duration"])
-    tgt_durs = np.array(target_ds["duration"])
-    valid_mask = (src_durs <= MAX_DURATION_SECONDS) & (tgt_durs <= MAX_DURATION_SECONDS)
-    valid_indices = np.where(valid_mask)[0]
-
-    print(f"Kept {len(valid_indices)} / {min_len} samples (Duration Filter).")
-    source_ds = source_ds.select(valid_indices)
-    target_ds = target_ds.select(valid_indices)
-    source_ds = source_ds.remove_columns(["duration"])
-    target_ds = target_ds.remove_columns(["duration"])
-
-    # 3. Filter by Language
-    print("Filtering by Language (Whisper Detection)...")
-    source_ds = source_ds.map(
-        check_language,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": SOURCE_LANG},
-        desc=f"Checking Source Language ({SOURCE_LANG})",
-    )
-    target_ds = target_ds.map(
-        check_language,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": TARGET_LANG},
-        desc=f"Checking Target Language ({TARGET_LANG})",
-    )
-
-    src_valid = np.array(source_ds["is_valid_lang"])
-    tgt_valid = np.array(target_ds["is_valid_lang"])
-    lang_mask = src_valid & tgt_valid
-    lang_valid_indices = np.where(lang_mask)[0]
-
-    print(f"Kept {len(lang_valid_indices)} / {len(source_ds)} samples (Language Filter).")
-    source_ds = source_ds.select(lang_valid_indices)
-    target_ds = target_ds.select(lang_valid_indices)
-    source_ds = source_ds.remove_columns(["is_valid_lang"])
-    target_ds = target_ds.remove_columns(["is_valid_lang"])
-
     # 4. SOURCE: Encode English audio → WavLM hidden states (input_values)
     print("Encoding SOURCE (EN) with frozen WavLM...")
     source_ds = source_ds.map(
@@ -331,9 +234,117 @@ def preprocess_vocoder_data(num_samples=None):
     print(f"  Columns      : {paired_ds.column_names}")
     print(f"  Output path  : {out_path}")
 
+    # --- Cache predicted mel spectrograms from frozen SpeechT5 ---
+    # Path to where your fine-tuned WavLM+SpeechT5 weights are saved
+    generate_and_cache_predicted_mel(
+        out_path,
+        out_path
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Cache predicted mel spectrograms from frozen SpeechT5
+# ---------------------------------------------------------------------------
+
+def generate_and_cache_predicted_mel(paired_ds_path, output_ds_path, model_path, device="cuda"):
+    """
+    Loads the preprocessed dataset, runs the frozen SpeechT5+WavLM
+    architecture sequentially to get the 'predicted_mel', and saves
+    it to the output dataset path.
+    """
+    import torch
+    from datasets import load_from_disk
+    from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
+    import numpy as np
+
+    print(f"\n--- Starting Phase 2: Caching Predicted Mel Spectrograms ---")
+    ds = load_from_disk(paired_ds_path)
+
+    # 1. Load the customized model and embedding
+    print(f"Loading custom model from {model_path}...")
+    from model import SpeechT5WavLM  # Assumes your model class is importable
+    custom_model = SpeechT5WavLM()
+    custom_model.load(model_path)
+    custom_model.model.eval()
+
+    speaker_embedding = custom_model.target_embeddings.to(device)
+
+    predicted_mels = []
+
+    # 2. Iterate sequentially (Batch size 8 prevents OOM)
+    print("Running forward pass to generate predicted spectrograms...")
+    with torch.no_grad():
+        for i in range(0, len(ds), 8):
+            batch = ds[i:i+8]
+
+            # Reconstruct tensors with explicit float32 dtype
+            input_values = [torch.tensor(np.array(x).reshape(-1, 768), dtype=torch.float32) for x in batch["input_values"]]
+            labels = [torch.tensor(np.array(x).reshape(-1, 80), dtype=torch.float32) for x in batch["labels"]]
+
+            # Pad sequences
+            input_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True).to(device)
+            labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100.0).to(device)
+            attn_mask = (input_padded.abs().sum(dim=-1) != 0).long()
+
+            spk_embeds = speaker_embedding.unsqueeze(0).expand(input_padded.shape[0], -1)
+
+            # WavLM Injection
+            hidden_states = torch.nn.functional.layer_norm(input_padded, [input_padded.shape[-1]])
+            prenet = custom_model.model.speecht5.encoder.prenet
+            hidden_states = hidden_states + prenet.pos_conv_embed(hidden_states)
+
+            padding_mask = attn_mask.ne(1).long()
+            pos_sin = prenet.pos_sin_embed(padding_mask) if hasattr(prenet, "pos_sin_embed") else prenet.pos_sinusoidal_embed(padding_mask)
+            hidden_states = hidden_states + pos_sin
+
+            encoder_obj = custom_model.model.speecht5.encoder
+            if hasattr(encoder_obj, "wrapped_encoder"):
+                encoder_obj = encoder_obj.wrapped_encoder
+            encoder_out = encoder_obj(hidden_states=hidden_states, attention_mask=attn_mask, return_dict=True)
+
+            decoder_input_values, decoder_attention_mask = shift_spectrograms_right(
+                labels_padded, custom_model.model.config.reduction_factor, None
+            )
+
+            outputs = custom_model.model.speecht5(
+                encoder_outputs=encoder_out,
+                attention_mask=attn_mask,
+                decoder_input_values=decoder_input_values,
+                decoder_attention_mask=decoder_attention_mask,
+                speaker_embeddings=spk_embeds,
+                use_cache=False,
+                return_dict=True,
+            )
+
+            _, outputs_after_postnet, _ = custom_model.model.speech_decoder_postnet(outputs.last_hidden_state)
+
+            # Extract unpadded mels and move to CPU numpy for saving
+            for j in range(len(batch["labels"])):
+                T_tgt = labels[j].shape[0]
+                pred_mel = outputs_after_postnet[j, :T_tgt, :].cpu().numpy()
+                predicted_mels.append(pred_mel)
+
+            if i % 80 == 0:
+                print(f"Processed {i}/{len(ds)} samples...")
+
+    # 3. Save new column to dataset
+    print(f"Appending 'predicted_mel' to dataset and saving to {output_ds_path}...")
+    ds = ds.add_column("predicted_mel", predicted_mels)
+    ds.save_to_disk(output_ds_path)
+    print("Caching complete!")
+
 
 if __name__ == "__main__":
     # For testing, use a small number of samples if requested or default to 15000
-    test_mode = "--test" in sys.argv
-    num_samples = 10 if test_mode else 15000
-    preprocess_vocoder_data(num_samples=num_samples)
+    # test_mode = "--test" in sys.argv
+    # num_samples = 10 if test_mode else 15000
+    # preprocess_vocoder_data(num_samples=num_samples)
+    
+    # For upgrading the local dataset directly
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+    input_ds = os.path.join(project_root, "datasets", "processed_vocoder_en_de_v1")
+    output_ds = os.path.join(project_root, "datasets", "processed_vocoder_en_de_v2")
+    model_path = os.path.join(os.path.dirname(__file__), "speecht5_wavlm_en_de_v3")
+    
+    print(f"Upgrading dataset:\n  From: {input_ds}\n  To:   {output_ds}")
+    generate_and_cache_predicted_mel(input_ds, output_ds, model_path)
