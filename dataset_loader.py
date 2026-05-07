@@ -12,6 +12,20 @@ sys.path.append(project_root)
 
 NUM_PROC = 4
 
+CVSS_LANGS = ['ar', 'ca', 'cy', 'de', 'el', 'es', 'et', 'fa', 'fr', 'id', 'it', 'ja', 'lv', 'mn', 'nl', 'pt', 'ru', 'sl', 'sv', 'tr', 'zh']
+
+def generate_id_from_string(s):
+    """
+    Consistently generates a 64-bit integer ID from a string.
+    If the string is numeric, it converts it directly.
+    Otherwise, it uses a stable hash (non-randomized) to ensure consistency across sessions.
+    """
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        import hashlib
+        # Use md5 for a stable hash across different python processes/sessions
+        return int(hashlib.md5(s.encode('utf-8')).hexdigest()[:16], 16)
 
 def transform_internal(batch):
     batch['id'] = int(batch['id'])
@@ -156,10 +170,7 @@ def _process_seamless_dataset(ds, lang_code, config_name, start_idx=0, num_sampl
         def map_seamless_cols(batch):
             key = batch['__key__']
             clean_id = key.replace(prefix, '').replace('/', '')
-            try:
-                int_id = int(clean_id)
-            except:
-                int_id = int(hash(clean_id) % 1e16)
+            int_id = generate_id_from_string(clean_id)
             
             return {
                 'id': int_id,
@@ -421,10 +432,16 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
     
     return datasets
 
-def verify_dataset_language(ds, target_lang, model_size="base", threshold=0.75):
+def verify_dataset_language(ds, target_lang, model_size="tiny", threshold=0.75):
     """
     Filters the dataset to ensure all samples match target_lang using LID.
     Uses faster-whisper for fast inference.
+
+    Handles two audio formats that HuggingFace may produce:
+      - Decoded : {'array': np.ndarray, 'sampling_rate': int}
+      - Raw bytes: {'bytes': bytes,     'path': str | None}
+    The seamless_align pipeline stores audio as raw MP3 bytes until the
+    dataset is cast to an Audio() feature, so we must handle both.
     """
     try:
         from faster_whisper import WhisperModel
@@ -432,41 +449,75 @@ def verify_dataset_language(ds, target_lang, model_size="base", threshold=0.75):
         print("Warning: faster-whisper not installed. Skipping language filtering.")
         return ds
 
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    
-    print(f"Initializing Whisper LID model ({model_size}) on {device}...")
-    # Using a local cache to avoid re-loading model in map if possible
-    # but for a single call here it's fine.
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    
+    import io
+
+    # Always use CPU + int8 for LID.
+    # CTranslate2 (used by faster-whisper) requires a cuDNN version that may not
+    # be present on all systems; LID is fast enough on CPU with a tiny model.
+    print(f"Initializing Whisper LID model ({model_size}) on cpu...")
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+
+    def _decode_audio(audio) -> np.ndarray:
+        """
+        Normalise an HF audio field to a 16 kHz float32 numpy array.
+        Returns None if decoding fails.
+        """
+        try:
+            if isinstance(audio, dict):
+                # --- Already-decoded Audio feature ---
+                if audio.get('array') is not None:
+                    arr = np.array(audio['array'], dtype=np.float32)
+                    sr  = audio.get('sampling_rate', 16000)
+                # --- Raw bytes (MP3 / WAV etc.) ---
+                elif audio.get('bytes') is not None:
+                    arr, sr = sf.read(io.BytesIO(audio['bytes']))
+                    arr = arr.astype(np.float32)
+                    if arr.ndim > 1:           # stereo → mono
+                        arr = arr.mean(axis=1)
+                else:
+                    return None
+            else:
+                return None
+
+            # Resample to 16 kHz if needed
+            if sr != 16000:
+                import librosa
+                arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+
+            return arr
+        except Exception:
+            return None
+
     def check_lang_batch(batch):
         mask = []
         for audio in batch['audio']:
-            # Whisper expects 16kHz audio. datasets usually provides it or we resample.
-            # transcribe returns (segments_generator, info)
             try:
-                _, info = model.transcribe(audio['array'], beam_size=1)
+                arr = _decode_audio(audio)
+                if arr is None:
+                    mask.append(False)
+                    continue
+                _, info = model.transcribe(arr, beam_size=1)
                 is_match = (info.language == target_lang and info.language_probability > threshold)
                 mask.append(is_match)
             except Exception as e:
                 print(f"Error during LID: {e}")
                 mask.append(False)
         return {"is_correct_lang": mask}
-    
-    # We use a small batch size to avoid OOM on GPU
+
+    # Single-process map to avoid spawning Whisper model in every worker
     mask_ds = ds.map(
-        check_lang_batch, 
-        batched=True, 
-        batch_size=16, 
+        check_lang_batch,
+        batched=True,
+        batch_size=16,
+        num_proc=1,
         remove_columns=ds.column_names,
         desc=f"LID Verification ({target_lang})"
     )
-    
+
     valid_indices = [i for i, val in enumerate(mask_ds['is_correct_lang']) if val]
     print(f"LID Filter ({target_lang}): Kept {len(valid_indices)}/{len(ds)} samples.")
     return ds.select(valid_indices)
+
 
 def play_audio(record):
   return Audio(data=record['audio']['array'], rate=record['audio']['sampling_rate'])
