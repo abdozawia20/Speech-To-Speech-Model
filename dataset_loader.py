@@ -194,7 +194,7 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
         print(f"Loading {hf_dataset_name} ({local_config_name}) from local storage: {local_path}...")
         ds = load_from_disk(local_path)
         
-        if num_samples is not None and dataset_key != 'seamless_align':
+        if num_samples is not None and dataset_key not in ('seamless_align', 'cvss', 'cv4'):
              total = len(ds)
              start = start_idx
              end = min(start + num_samples, total)
@@ -233,7 +233,7 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
         dataset.save_to_disk(local_path)
         print("Save complete.")
         
-        if num_samples is not None and dataset_key != 'seamless_align':
+        if num_samples is not None and dataset_key not in ('seamless_align', 'cvss', 'cv4'):
              total = len(dataset)
              start = start_idx
              end = min(start + num_samples, total)
@@ -317,8 +317,10 @@ def _load_cvss_data(split, lang_list, start_idx, num_samples):
         ds_src = _load_or_download_generic('cv4', 'mozilla-foundation/common_voice_4_0', lang, lang, split, num_samples=num_samples, start_idx=start_idx)
         if ds_src:
             def transform_cv4(batch):
+                # Strip extension from path to match CVSS IDs
+                clean_path = os.path.splitext(batch['path'])[0]
                 return {
-                    'id': generate_id_from_string(str(batch['path'])),
+                    'id': generate_id_from_string(str(clean_path)),
                     'audio': batch['audio'],
                     'transcription': batch['sentence'],
                     'language': lang,
@@ -339,7 +341,7 @@ def _load_cvss_data(split, lang_list, start_idx, num_samples):
                 return {
                     'id': generate_id_from_string(str(batch['id'])),
                     'audio': batch['audio'],
-                    'transcription': batch['transcription'],
+                    'transcription': batch['text'],
                     'language': 'en',
                     'gender': 'unknown'
                 }
