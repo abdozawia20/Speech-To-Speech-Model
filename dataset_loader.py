@@ -284,6 +284,8 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples):
          
          if ds:
              ds = _process_seamless_dataset(ds, lang_code, pair_config, start_idx, num_samples)
+             print(f"--- Language Filtering Enabled Exceptionally for Seamless Align ---")
+             ds = verify_dataset_language(ds, lang_code)
              datasets_dict[lang_code] = ds
              
     return datasets_dict
@@ -418,6 +420,53 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
                 )
     
     return datasets
+
+def verify_dataset_language(ds, target_lang, model_size="base", threshold=0.75):
+    """
+    Filters the dataset to ensure all samples match target_lang using LID.
+    Uses faster-whisper for fast inference.
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("Warning: faster-whisper not installed. Skipping language filtering.")
+        return ds
+
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    
+    print(f"Initializing Whisper LID model ({model_size}) on {device}...")
+    # Using a local cache to avoid re-loading model in map if possible
+    # but for a single call here it's fine.
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    
+    def check_lang_batch(batch):
+        mask = []
+        for audio in batch['audio']:
+            # Whisper expects 16kHz audio. datasets usually provides it or we resample.
+            # transcribe returns (segments_generator, info)
+            try:
+                _, info = model.transcribe(audio['array'], beam_size=1)
+                is_match = (info.language == target_lang and info.language_probability > threshold)
+                mask.append(is_match)
+            except Exception as e:
+                print(f"Error during LID: {e}")
+                mask.append(False)
+        return {"is_correct_lang": mask}
+    
+    # We use a small batch size to avoid OOM on GPU
+    mask_ds = ds.map(
+        check_lang_batch, 
+        batched=True, 
+        batch_size=16, 
+        remove_columns=ds.column_names,
+        desc=f"LID Verification ({target_lang})"
+    )
+    
+    valid_indices = [i for i, val in enumerate(mask_ds['is_correct_lang']) if val]
+    print(f"LID Filter ({target_lang}): Kept {len(valid_indices)}/{len(ds)} samples.")
+    return ds.select(valid_indices)
 
 def play_audio(record):
   return Audio(data=record['audio']['array'], rate=record['audio']['sampling_rate'])

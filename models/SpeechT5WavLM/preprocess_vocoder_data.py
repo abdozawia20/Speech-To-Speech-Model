@@ -2,7 +2,6 @@ import os
 import sys
 import torch
 import numpy as np
-from faster_whisper import WhisperModel
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
@@ -224,7 +223,7 @@ def preprocess_vocoder_data(num_samples=None):
     # 7. Save
     out_path = os.path.join(
         OUTPUT_DIR,
-        f"processed_vocoder_{SOURCE_LANG}_{TARGET_LANG}_v1",
+        f"processed_vocoder_{SOURCE_LANG}_{TARGET_LANG}_v3",
     )
     print(f"Saving paired dataset to {out_path}...")
     paired_ds.save_to_disk(out_path)
@@ -341,15 +340,8 @@ def generate_and_cache_predicted_mel(paired_ds_path, output_ds_path, model_path,
 
 if __name__ == "__main__":
     # For testing, use a small number of samples if requested or default to 15000
-    # test_mode = "--test" in sys.argv
-    # num_samples = 10 if test_mode else 15000
-    # preprocess_vocoder_data(num_samples=num_samples)
+    test_mode = "--test" in sys.argv
+    num_samples = 10 if test_mode else 15000
+    preprocess_vocoder_data(num_samples=num_samples)
     
-    # For upgrading the local dataset directly
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
-    input_ds = os.path.join(project_root, "datasets", "processed_vocoder_en_de_v1")
-    output_ds = os.path.join(project_root, "datasets", "processed_vocoder_en_de_v2")
-    model_path = os.path.join(os.path.dirname(__file__), "speecht5_wavlm_en_de_v3")
     
-    print(f"Upgrading dataset:\n  From: {input_ds}\n  To:   {output_ds}")
-    generate_and_cache_predicted_mel(input_ds, output_ds, model_path)
