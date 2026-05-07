@@ -183,7 +183,7 @@ def _process_seamless_dataset(ds, lang_code, config_name, start_idx=0, num_sampl
         ds = ds.map(map_seamless_cols, remove_columns=['mp3', '__key__', '__url__'])
     return ds
 
-def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_config_name, split, data_files=None, num_samples=None, start_idx=0):
+def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_config_name, split, data_files=None, num_samples=None, start_idx=0, **kwargs):
     cache_dir = os.path.join(DATASETS_DIR, ".cache")
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir, exist_ok=True)
@@ -209,7 +209,7 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
     
     size_info = "Size info unavailable"
     try:
-         builder = load_dataset_builder(hf_dataset_name, hf_config, trust_remote_code=True, cache_dir=cache_dir)
+         builder = load_dataset_builder(hf_dataset_name, hf_config, trust_remote_code=True, cache_dir=cache_dir, **kwargs)
          dl_s = builder.info.download_size
          ds_s = builder.info.dataset_size
          if dl_s and ds_s:
@@ -219,15 +219,18 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
          
     print(f"This will download to {local_path}. {size_info}")
     
-    response = input(f"Proceed with download of {dataset_key}? (Y/n): ").strip().lower()
-    if response not in ('', 'y', 'yes'):
-        print("Aborted.")
-        return None
+    if sys.stdin.isatty():
+        response = input(f"Proceed with download of {dataset_key}? (Y/n): ").strip().lower()
+        if response not in ('', 'y', 'yes'):
+            print("Aborted.")
+            return None
+    else:
+        print(f"Non-interactive environment detected. Proceeding with download of {dataset_key}...")
         
     print(f"Downloading {hf_dataset_name}...")
     config = DownloadConfig(resume_download=True, max_retries=10)
     try:
-        dataset = load_dataset(hf_dataset_name, hf_config, split=split, trust_remote_code=True, download_config=config, cache_dir=cache_dir, data_files=data_files)
+        dataset = load_dataset(hf_dataset_name, hf_config, split=split, trust_remote_code=True, download_config=config, cache_dir=cache_dir, data_files=data_files, **kwargs)
         
         print(f"Saving to {local_path}...")
         dataset.save_to_disk(local_path)
@@ -334,8 +337,9 @@ def _load_cvss_data(split, lang_list, start_idx, num_samples):
             datasets_dict[lang] = ds_src
             
         # Target side: CVSS (English translation)
-        cvss_config = f"cvss_t_{lang}_en"
-        ds_tgt = _load_or_download_generic('cvss', 'google/cvss', cvss_config, cvss_config, split, num_samples=num_samples, start_idx=start_idx)
+        cvss_config = "cvss_t"
+        local_cfg = f"cvss_t_{lang}"
+        ds_tgt = _load_or_download_generic('cvss', 'google/cvss', cvss_config, local_cfg, split, num_samples=num_samples, start_idx=start_idx, languages=[lang])
         if ds_tgt:
             def transform_cvss(batch):
                 return {
