@@ -367,17 +367,17 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
     final_datasets = collections.defaultdict(list)
     
     if 'fleurs' in dataset:
-        fleurs_res = _load_fleurs_data(split, lang, start_idx, num_samples)
+        fleurs_res = _load_fleurs_data(split, lang, 0, None)
         for l, ds in fleurs_res.items():
             final_datasets[l].append(ds)
             
     if 'seamless_align' in dataset:
-        seamless_res = _load_seamless_data(split, lang, start_idx, num_samples)
+        seamless_res = _load_seamless_data(split, lang, 0, None)
         for l, ds in seamless_res.items():
             final_datasets[l].append(ds)
 
     if 'cvss' in dataset:
-        cvss_res = _load_cvss_data(split, lang, start_idx, num_samples)
+        cvss_res = _load_cvss_data(split, lang, 0, None)
         for l, ds in cvss_res.items():
             final_datasets[l].append(ds)
             
@@ -449,6 +449,14 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
             
     print(f"Final Count: {len(common_ids)} common valid samples.")
 
+    # Apply slicing to common IDs
+    sorted_common = sorted(list(common_ids))
+    if num_samples is not None:
+        end_idx = start_idx + num_samples
+        sorted_common = sorted_common[start_idx:end_idx]
+    else:
+        sorted_common = sorted_common[start_idx:]
+
     for lang_key in datasets:
         if datasets[lang_key] is None: continue
         src_ids = datasets[lang_key]['id']
@@ -457,7 +465,6 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
              if uid not in id_to_idx:
                  id_to_idx[uid] = idx
         
-        sorted_common = sorted(list(common_ids))
         final_indices = [id_to_idx[uid] for uid in sorted_common if uid in id_to_idx]
         
         datasets[lang_key] = datasets[lang_key].select(final_indices)
