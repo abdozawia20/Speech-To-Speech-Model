@@ -301,6 +301,63 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples):
              
     return datasets_dict
 
+def _load_cvss_data(split, lang_list, start_idx, num_samples):
+    datasets_dict = {}
+    columns_to_keep = ['id', 'audio', 'transcription', 'language', 'gender']
+    
+    if lang_list is None: return datasets_dict
+
+    en_targets = []
+    for lang in lang_list:
+        if lang == 'en' or lang not in CVSS_LANGS:
+            continue
+            
+        # Source side: Common Voice 4.0
+        # Note: mozilla-foundation/common_voice_4_0 is gated and may require a token.
+        ds_src = _load_or_download_generic('cv4', 'mozilla-foundation/common_voice_4_0', lang, lang, split, num_samples=num_samples, start_idx=start_idx)
+        if ds_src:
+            def transform_cv4(batch):
+                return {
+                    'id': generate_id_from_string(str(batch['path'])),
+                    'audio': batch['audio'],
+                    'transcription': batch['sentence'],
+                    'language': lang,
+                    'gender': batch['gender'] if 'gender' in batch else 'unknown'
+                }
+            ds_src = ds_src.map(
+                transform_cv4, 
+                remove_columns=[col for col in ds_src.features if col not in columns_to_keep and col != 'audio'],
+                num_proc=NUM_PROC
+            )
+            datasets_dict[lang] = ds_src
+            
+        # Target side: CVSS (English translation)
+        cvss_config = f"cvss_t_{lang}_en"
+        ds_tgt = _load_or_download_generic('cvss', 'google/cvss', cvss_config, cvss_config, split, num_samples=num_samples, start_idx=start_idx)
+        if ds_tgt:
+            def transform_cvss(batch):
+                return {
+                    'id': generate_id_from_string(str(batch['id'])),
+                    'audio': batch['audio'],
+                    'transcription': batch['transcription'],
+                    'language': 'en',
+                    'gender': 'unknown'
+                }
+            ds_tgt = ds_tgt.map(
+                transform_cvss, 
+                remove_columns=[col for col in ds_tgt.features if col not in columns_to_keep and col != 'audio'],
+                num_proc=NUM_PROC
+            )
+            en_targets.append(ds_tgt)
+
+    if en_targets:
+        if len(en_targets) > 1:
+            datasets_dict['en'] = concatenate_datasets(en_targets)
+        else:
+            datasets_dict['en'] = en_targets[0]
+            
+    return datasets_dict
+
 def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="train", dataset=None):
     if dataset is None: dataset = ['fleurs']
     if lang is None: lang = []
@@ -315,6 +372,11 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None, split="t
     if 'seamless_align' in dataset:
         seamless_res = _load_seamless_data(split, lang, start_idx, num_samples)
         for l, ds in seamless_res.items():
+            final_datasets[l].append(ds)
+
+    if 'cvss' in dataset:
+        cvss_res = _load_cvss_data(split, lang, start_idx, num_samples)
+        for l, ds in cvss_res.items():
             final_datasets[l].append(ds)
             
     # Concatenate
