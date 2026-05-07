@@ -255,7 +255,7 @@ class VocoderTrainer:
         self.mpd = MultiPeriodDiscriminator().to(device)
         self.msd = MultiScaleDiscriminator().to(device)
 
-    def train(self, preprocessed_path, epochs, learning_rate, batch_size):
+    def train(self, preprocessed_path, epochs, learning_rate, batch_size, save_callback=None):
         print("Initializing Vocoder Trainer...")
         
         # Datasets
@@ -361,5 +361,8 @@ class VocoderTrainer:
                     "D_Loss": f"{loss_disc_all.item():.4f}",
                     "G_Loss": f"{loss_gen_all.item():.4f}"
                 })
+
+            if save_callback is not None:
+                save_callback(epoch + 1)
 
         print("Vocoder fine-tuning complete!")

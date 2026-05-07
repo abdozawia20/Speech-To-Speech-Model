@@ -557,7 +557,13 @@ class SpeechT5WavLM(torch.nn.Module):
         )
         
         try:
-            trainer.train(preprocessed_path, epochs, learning_rate, batch_size)
+            trainer.train(
+                preprocessed_path, 
+                epochs, 
+                learning_rate, 
+                batch_size,
+                save_callback=lambda epoch: self.save(f"vocoder_checkpoint_epoch_{epoch}")
+            )
         except KeyboardInterrupt:
             print("\nTraining interrupted! Saving current progress...")
             self.save("speecht5_wavlm_vocoder_interrupted")
