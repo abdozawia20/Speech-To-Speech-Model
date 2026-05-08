@@ -7,6 +7,7 @@ import soundfile as sf
 import hashlib
 import io
 import traceback
+import aiohttp
 from datasets import load_dataset, concatenate_datasets, DownloadConfig, IterableDataset, Dataset, load_from_disk, load_dataset_builder
 from IPython.display import Audio
 from encoders import *
@@ -227,7 +228,13 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
         print(f"Non-interactive environment: Proceeding with download of {dataset_key}...")
         
     print(f"Downloading {hf_dataset_name}...")
-    dl_config = DownloadConfig(resume_download=True, max_retries=15)
+    # Increase timeout and retries for large datasets like CVSS
+    dl_config = DownloadConfig(
+        resume_download=True, 
+        max_retries=20, 
+        num_proc=NUM_PROC,
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}} # 1 hour timeout
+    )
     try:
         dataset = load_dataset(hf_dataset_name, hf_config, split=split, trust_remote_code=True, 
                                download_config=dl_config, cache_dir=cache_dir, data_files=data_files, 
