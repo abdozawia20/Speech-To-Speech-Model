@@ -46,7 +46,7 @@ def _get_wavlm_model():
     if _wavlm_model_cache is None:
         from transformers import Wav2Vec2FeatureExtractor, WavLMModel
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading WavLM ({WAVLM_MODEL_NAME}) on {device} in worker (PID: {os.getpid()})...")
+        print(f"Loading WavLM ({WAVLM_MODEL_NAME}) on {device}...")
         
         _wavlm_proc_cache = Wav2Vec2FeatureExtractor.from_pretrained(WAVLM_MODEL_NAME)
         _wavlm_model_cache = WavLMModel.from_pretrained(WAVLM_MODEL_NAME).to(device)
@@ -171,14 +171,12 @@ def preprocess_vocoder_data(num_samples=None):
     print(f"  Target modality : 80-bin mel-spectrogram + 16kHz Waveform")
     print(f"  Max Duration    : {MAX_DURATION_SECONDS}s")
 
-    num_proc = 2
-    
     # 1. Load Raw Data
     print("Loading raw datasets...")
     datasets = dataset_loader.load_data(
         lang=[SOURCE_LANG, TARGET_LANG],
         split="train",
-        dataset=["seamless_align"],
+        dataset=["fleurs"],
         num_samples=num_samples if num_samples else 15000,
     )
 
@@ -197,7 +195,6 @@ def preprocess_vocoder_data(num_samples=None):
         process_source_wavlm,
         batched=True,
         batch_size=64,
-        num_proc=num_proc,
         desc="WavLM Encoding Source Audio",
         remove_columns=["audio"],
     )
@@ -208,7 +205,6 @@ def preprocess_vocoder_data(num_samples=None):
         process_target_vocoder,
         batched=True,
         batch_size=16,
-        num_proc=num_proc,
         desc="Vocoder Encoding Target Audio",
         remove_columns=["audio"],
     )
@@ -235,10 +231,19 @@ def preprocess_vocoder_data(num_samples=None):
 
     # --- Cache predicted mel spectrograms from frozen SpeechT5 ---
     # Path to where your fine-tuned WavLM+SpeechT5 weights are saved
-    generate_and_cache_predicted_mel(
-        out_path,
-        out_path
-    )
+    model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speecht5_wavlm_en_de_v2026_05_08")
+    
+    if not os.path.exists(model_dir):
+        print(f"ERROR: Model directory not found at: {model_dir}")
+        print("Please ensure you have the 'speecht5_wavlm_en_de_v2026_05_08' folder in the same directory as this script.")
+    else:
+        # Save to a new suffix to avoid PermissionError (overwrite source)
+        final_out_path = out_path + "_final"
+        generate_and_cache_predicted_mel(
+            out_path,
+            final_out_path,
+            model_path=model_dir
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -335,13 +340,11 @@ def generate_and_cache_predicted_mel(paired_ds_path, output_ds_path, model_path,
     mel_ds = Dataset.from_generator(mel_generator)
     ds = concatenate_datasets([ds, mel_ds], axis=1)
     ds.save_to_disk(output_ds_path)
-    print("Caching complete!")
+    print(f"Caching complete! Final dataset saved to {output_ds_path}")
 
 
 if __name__ == "__main__":
     # For testing, use a small number of samples if requested or default to 15000
     test_mode = "--test" in sys.argv
-    num_samples = 10 if test_mode else 15000
+    num_samples = 10 if test_mode else 20000
     preprocess_vocoder_data(num_samples=num_samples)
-    
-    

@@ -1,16 +1,14 @@
 import os
 import torch
 import numpy as np
-from faster_whisper import WhisperModel
 import dataset_loader
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-dataset_loader.NUM_PROC = 4
+dataset_loader.NUM_PROC = 1
 SOURCE_LANG = "en"
 TARGET_LANG = "de"
-MAX_DURATION_SECONDS = 8.0
 OUTPUT_DIR = dataset_loader.DATASETS_DIR
 
 # WavLM model for SOURCE encoding (English → continuous hidden states)
@@ -22,60 +20,9 @@ SPEECHT5_MODEL_NAME = "microsoft/speecht5_vc"
 # ---------------------------------------------------------------------------
 # Global state for worker processes
 # ---------------------------------------------------------------------------
-language_model = None          # Whisper language detector (language filter step)
 _wavlm_proc_cache = None       # Wav2Vec2FeatureExtractor for WavLM
 _wavlm_model_cache = None      # Frozen WavLMModel backbone
 _speecht5_proc_cache = None    # SpeechT5Processor (mel-spectrogram extractor)
-
-
-# ---------------------------------------------------------------------------
-# Worker utilities — language detection
-# ---------------------------------------------------------------------------
-
-def compute_duration(batch):
-    """Calculate duration of audio clips in batch."""
-    durations = []
-    for x in batch["audio"]:
-        durations.append(len(x["array"]) / x["sampling_rate"])
-    return {"duration": durations}
-
-
-def check_language(batch, expected_lang):
-    """
-    Detect the language of each audio clip using faster-whisper and return
-    a boolean column 'is_valid_lang'.
-    """
-    global language_model
-
-    if language_model is None:
-        try:
-            print(f"Loading Whisper model in worker (PID: {os.getpid()})...")
-            language_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        except Exception as e:
-            print(f"Warning: Failed to load Whisper model in worker: {e}")
-            return {"is_valid_lang": [True] * len(batch["audio"])}
-
-    is_valid = []
-    for x in batch["audio"]:
-        audio = x["array"]
-        sr = x["sampling_rate"]
-
-        if sr != 16000:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-
-        try:
-            segments, info = language_model.transcribe(
-                audio,
-                beam_size=1,
-                language=None,
-                task="transcribe",
-            )
-            is_valid.append(info.language == expected_lang)
-        except Exception:
-            is_valid.append(True)  # keep on transcription error
-
-    return {"is_valid_lang": is_valid}
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +185,6 @@ def preprocess_and_save_wavlm():
     print(f"--- Hybrid WavLM/SpeechT5 Preprocessing {SOURCE_LANG} -> {TARGET_LANG} ---")
     print(f"  Source modality : WavLM hidden states ({WAVLM_MODEL_NAME})")
     print(f"  Target modality : 80-bin mel-spectrogram ({SPEECHT5_MODEL_NAME})")
-    print(f"  Max Duration    : {MAX_DURATION_SECONDS}s")
 
     # num_proc=1 is safest when loading heavy neural net models inside
     # worker processes via fork; avoids CUDA context clashes and OOM.
@@ -252,7 +198,7 @@ def preprocess_and_save_wavlm():
     datasets = dataset_loader.load_data(
         lang=[SOURCE_LANG, TARGET_LANG],
         split="train",
-        dataset=["cvss"],
+        dataset=["fleurs"],
         num_samples=20000,
     )
 
@@ -271,53 +217,7 @@ def preprocess_and_save_wavlm():
     print(f"Initial aligned pairs: {min_len}")
 
     # ------------------------------------------------------------------
-    # 2. Filter by Duration
-    # ------------------------------------------------------------------
-    print(f"Filtering samples > {MAX_DURATION_SECONDS}s...")
-    source_ds = source_ds.map(dataset_loader.compute_duration_batch, batched=True, num_proc=num_proc, desc="Calc Source Durations")
-    target_ds = target_ds.map(dataset_loader.compute_duration_batch, batched=True, num_proc=num_proc, desc="Calc Target Durations")
-
-    src_durs = np.array(source_ds["duration"])
-    tgt_durs = np.array(target_ds["duration"])
-    valid_mask = (src_durs <= MAX_DURATION_SECONDS) & (tgt_durs <= MAX_DURATION_SECONDS)
-    valid_indices = np.where(valid_mask)[0]
-
-    print(f"Kept {len(valid_indices)} / {min_len} samples (Duration Filter).")
-    source_ds = source_ds.select(valid_indices).remove_columns(["duration"])
-    target_ds = target_ds.select(valid_indices).remove_columns(["duration"])
-
-    # ------------------------------------------------------------------
-    # 3. Filter by Language (Whisper Detection)
-    # ------------------------------------------------------------------
-    print("Filtering by Language (Whisper Detection)...")
-    source_ds = source_ds.map(
-        dataset_loader.check_language_batch,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": SOURCE_LANG},
-        desc=f"Checking Source Language ({SOURCE_LANG})",
-    )
-    target_ds = target_ds.map(
-        dataset_loader.check_language_batch,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": TARGET_LANG},
-        desc=f"Checking Target Language ({TARGET_LANG})",
-    )
-
-    src_valid = np.array(source_ds["is_valid_lang"])
-    tgt_valid = np.array(target_ds["is_valid_lang"])
-    lang_mask = src_valid & tgt_valid
-    lang_valid_indices = np.where(lang_mask)[0]
-
-    print(f"Kept {len(lang_valid_indices)} / {len(source_ds)} samples (Language Filter).")
-    source_ds = source_ds.select(lang_valid_indices).remove_columns(["is_valid_lang"])
-    target_ds = target_ds.select(lang_valid_indices).remove_columns(["is_valid_lang"])
-
-    # ------------------------------------------------------------------
-    # 4. SOURCE: Encode English audio → WavLM hidden states (input_values)
+    # 2. SOURCE: Encode English audio → WavLM hidden states (input_values)
     # ------------------------------------------------------------------
     print("Encoding SOURCE (EN) with frozen WavLM → hidden states (Seq_Len, 768)...")
     source_ds = source_ds.map(
@@ -330,7 +230,7 @@ def preprocess_and_save_wavlm():
     )
 
     # ------------------------------------------------------------------
-    # 5. TARGET: Encode German audio → 80-bin mel-spectrogram (labels)
+    # 3. TARGET: Encode German audio → 80-bin mel-spectrogram (labels)
     # ------------------------------------------------------------------
     print("Encoding TARGET (DE) with SpeechT5Processor → 80-bin mel-spectrogram (T, 80)...")
     target_ds = target_ds.map(
@@ -343,7 +243,7 @@ def preprocess_and_save_wavlm():
     )
 
     # ------------------------------------------------------------------
-    # 6. Merge into a single paired dataset
+    # 4. Merge into a single paired dataset
     # ------------------------------------------------------------------
     # Both datasets now have the same number of rows (aligned pairs).
     # We add the 'labels' column from target_ds into source_ds so the
@@ -358,7 +258,7 @@ def preprocess_and_save_wavlm():
     paired_ds = concatenate_datasets([source_ds, target_ds], axis=1)
 
     # ------------------------------------------------------------------
-    # 7. Save to Disk
+    # 5. Save to Disk
     # ------------------------------------------------------------------
     out_path = os.path.join(
         OUTPUT_DIR,
