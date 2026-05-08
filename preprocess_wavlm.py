@@ -252,12 +252,17 @@ def preprocess_and_save_wavlm():
     datasets = dataset_loader.load_data(
         lang=[SOURCE_LANG, TARGET_LANG],
         split="train",
-        dataset=["seamless_align"],
-        num_samples=15000,
+        dataset=["cvss"],
+        num_samples=20000,
     )
 
-    source_ds = datasets[SOURCE_LANG]
-    target_ds = datasets[TARGET_LANG]
+    source_ds = datasets.get(SOURCE_LANG)
+    target_ds = datasets.get(TARGET_LANG)
+
+    if source_ds is None or target_ds is None:
+        print(f"ERROR: Could not load one or both datasets ({SOURCE_LANG}, {TARGET_LANG}).")
+        print("Please check the logs above for download/access errors.")
+        return
 
     # Align lengths so every row is a valid (EN, DE) pair
     min_len = min(len(source_ds), len(target_ds))
@@ -268,28 +273,25 @@ def preprocess_and_save_wavlm():
     # ------------------------------------------------------------------
     # 2. Filter by Duration
     # ------------------------------------------------------------------
-    print("Calculating durations...")
-    source_ds = source_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Source Durations")
-    target_ds = target_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Target Durations")
-
     print(f"Filtering samples > {MAX_DURATION_SECONDS}s...")
+    source_ds = source_ds.map(dataset_loader.compute_duration_batch, batched=True, num_proc=num_proc, desc="Calc Source Durations")
+    target_ds = target_ds.map(dataset_loader.compute_duration_batch, batched=True, num_proc=num_proc, desc="Calc Target Durations")
+
     src_durs = np.array(source_ds["duration"])
     tgt_durs = np.array(target_ds["duration"])
     valid_mask = (src_durs <= MAX_DURATION_SECONDS) & (tgt_durs <= MAX_DURATION_SECONDS)
     valid_indices = np.where(valid_mask)[0]
 
     print(f"Kept {len(valid_indices)} / {min_len} samples (Duration Filter).")
-    source_ds = source_ds.select(valid_indices)
-    target_ds = target_ds.select(valid_indices)
-    source_ds = source_ds.remove_columns(["duration"])
-    target_ds = target_ds.remove_columns(["duration"])
+    source_ds = source_ds.select(valid_indices).remove_columns(["duration"])
+    target_ds = target_ds.select(valid_indices).remove_columns(["duration"])
 
     # ------------------------------------------------------------------
     # 3. Filter by Language (Whisper Detection)
     # ------------------------------------------------------------------
     print("Filtering by Language (Whisper Detection)...")
     source_ds = source_ds.map(
-        check_language,
+        dataset_loader.check_language_batch,
         batched=True,
         batch_size=8,
         num_proc=num_proc,
@@ -297,7 +299,7 @@ def preprocess_and_save_wavlm():
         desc=f"Checking Source Language ({SOURCE_LANG})",
     )
     target_ds = target_ds.map(
-        check_language,
+        dataset_loader.check_language_batch,
         batched=True,
         batch_size=8,
         num_proc=num_proc,
@@ -311,10 +313,8 @@ def preprocess_and_save_wavlm():
     lang_valid_indices = np.where(lang_mask)[0]
 
     print(f"Kept {len(lang_valid_indices)} / {len(source_ds)} samples (Language Filter).")
-    source_ds = source_ds.select(lang_valid_indices)
-    target_ds = target_ds.select(lang_valid_indices)
-    source_ds = source_ds.remove_columns(["is_valid_lang"])
-    target_ds = target_ds.remove_columns(["is_valid_lang"])
+    source_ds = source_ds.select(lang_valid_indices).remove_columns(["is_valid_lang"])
+    target_ds = target_ds.select(lang_valid_indices).remove_columns(["is_valid_lang"])
 
     # ------------------------------------------------------------------
     # 4. SOURCE: Encode English audio → WavLM hidden states (input_values)
