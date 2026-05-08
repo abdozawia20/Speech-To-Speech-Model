@@ -246,7 +246,7 @@ def _load_or_download_generic(dataset_key, hf_dataset_name, hf_config, local_con
         return dataset
     except Exception as e:
         print(f"FAILED to download/load {hf_dataset_name}: {e}")
-        if "gated" in str(e).lower() or "403" in str(e):
+        if "gated" in str(e).lower() or "403" in str(e) or "access" in str(e).lower():
             print("ERROR: This dataset is GATED. Please run `huggingface-cli login` or set HF_TOKEN environment variable.")
         else:
             traceback.print_exc()
@@ -294,9 +294,8 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples, **kwargs):
 
 def _load_cvss_data(split, lang_list, start_idx, num_samples, **kwargs):
     """
-    Loads Google CVSS dataset (English translation audio/text).
-    Mozilla Common Voice (cv4) has been removed per user request.
-    Note: This only provides the English side of the translation.
+    Loads Google CVSS dataset (English translation audio/text) AND
+    Mozilla Common Voice 4.0 for the source audio.
     """
     datasets_dict = {}
     cols = ['id', 'audio', 'transcription', 'language', 'gender']
@@ -306,6 +305,24 @@ def _load_cvss_data(split, lang_list, start_idx, num_samples, **kwargs):
     for lang in lang_list:
         if lang == 'en' or lang not in CVSS_LANGS: continue
             
+        # Source side: Common Voice 4.0 (Original Lang)
+        # Note: mozilla-foundation/common_voice_4_0 is gated and requires a token.
+        ds_src = _load_or_download_generic('cv4', 'mozilla-foundation/common_voice_4_0', lang, lang, split, 
+                                           num_samples=num_samples, start_idx=start_idx, **kwargs)
+        if ds_src:
+            def transform_cv4(batch):
+                import os
+                clean_path = os.path.splitext(batch['path'])[0]
+                return {
+                    'id': generate_id_from_string(str(clean_path)),
+                    'audio': batch['audio'], 
+                    'transcription': batch['sentence'],
+                    'language': lang, 
+                    'gender': batch.get('gender', 'unknown')
+                }
+            datasets_dict[lang] = ds_src.map(transform_cv4, remove_columns=[c for c in ds_src.features if c not in cols and c != 'audio'], num_proc=NUM_PROC)
+            
+        # Target side: CVSS (English translation)
         # CVSS provides (Original Lang) -> English pairs.
         # We load the 'transferred' version (cvss_t) which preserves speaker voice.
         ds_tgt = _load_or_download_generic('cvss', 'google/cvss', "cvss_t", f"cvss_t_{lang}", split, 
