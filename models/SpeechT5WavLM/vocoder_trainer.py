@@ -184,10 +184,7 @@ class SpeechT5VocoderDataset(Dataset):
     """
     def __init__(self, ds_path, speaker_embeddings, max_wav_value=32768.0):
         self.ds = load_from_disk(ds_path)
-        
-        # --- THE FIX: Force zero-copy PyTorch tensors ---
         self.ds.set_format(type="torch", columns=["predicted_mel", "labels", "target_waveform"])
-        
         self.speaker_embeddings = speaker_embeddings
         self.max_wav_value = max_wav_value
 
@@ -196,16 +193,10 @@ class SpeechT5VocoderDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.ds[int(idx)]
-
-        # Because of set_format("torch"), these are ALREADY PyTorch tensors!
-        # No more slow CPU np.array() conversions.
         predicted_mel = row["predicted_mel"].float()
         target_features = row["labels"].float()
         waveform = row["target_waveform"].float().unsqueeze(0) # (1, T)
 
-        # -------------------------------------------------------------
-        # Keep your existing shape alignment logic just in case:
-        # -------------------------------------------------------------
         if predicted_mel.ndim == 1:
             predicted_mel = predicted_mel.reshape(-1, 80)
 
@@ -234,8 +225,6 @@ def vocoder_collate_fn(batch):
 
     predicted_mels_padded = torch.nn.utils.rnn.pad_sequence(predicted_mels, batch_first=True, padding_value=-100.0)
     labels_padded = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100.0)
-    
-    # Pad waveforms
     waveforms_padded = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     waveforms_padded = waveforms_padded.unsqueeze(1) # (B, 1, T)
 
@@ -245,20 +234,33 @@ def vocoder_collate_fn(batch):
 # Trainer
 # =============================================================================
 
+def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
+    return torch.log(torch.clamp(x, min=clip_val) * C)
+
 class VocoderTrainer:
     def __init__(self, model, vocoder, device, target_embeddings):
-        self.model = model  # Kept for compatibility but no longer used in training loop
+        self.model = model
         self.vocoder = vocoder
         self.device = device
         self.target_embeddings = target_embeddings
 
         self.mpd = MultiPeriodDiscriminator().to(device)
         self.msd = MultiScaleDiscriminator().to(device)
+        
+        import torchaudio
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=1024,
+            win_length=1024,
+            hop_length=256,
+            f_min=80.0,
+            f_max=7600.0,
+            n_mels=80,
+            mel_scale="htk",
+        ).to(device)
 
     def train(self, preprocessed_path, epochs, learning_rate, batch_size, save_callback=None):
         print("Initializing Vocoder Trainer...")
-        
-        # Datasets
         train_dataset = SpeechT5VocoderDataset(preprocessed_path, self.target_embeddings)
         train_loader = DataLoader(
             train_dataset,
@@ -269,7 +271,6 @@ class VocoderTrainer:
             pin_memory=True,
         )
 
-        # Optimizers
         optim_g = torch.optim.AdamW(self.vocoder.parameters(), lr=learning_rate, betas=(0.8, 0.99))
         optim_d = torch.optim.AdamW(
             list(self.mpd.parameters()) + list(self.msd.parameters()), 
@@ -286,64 +287,48 @@ class VocoderTrainer:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
             
             for step, (predicted_mel, labels, target_waveform) in enumerate(pbar):
-                
                 predicted_mel = predicted_mel.to(self.device)
                 labels = labels.to(self.device)
                 target_waveform = target_waveform.to(self.device)
 
-                # =================================================================
-                # 1. Forward pass through frozen SpeechT5 is completely REMOVED!
-                #    We replace it with zeroing out padded frames in the cached mel
-                # =================================================================
-                # Zero out the padding (-100.0) so it doesn't break the vocoder
                 predicted_mel_clean = predicted_mel.clone()
                 predicted_mel_clean[predicted_mel == -100.0] = 0.0
 
-                # =================================================================
-                # 2. Generator (Vocoder) Forward
-                # =================================================================
-                # SpeechT5HifiGan expects (B, T, 80) and handles internal transpose
-                y_hat = self.vocoder(predicted_mel_clean) # (B, T_wav)
+                # 1. Generator Forward
+                y_hat = self.vocoder(predicted_mel_clean)
                 if y_hat.ndim == 2:
-                    y_hat = y_hat.unsqueeze(1) # (B, 1, T_wav)
+                    y_hat = y_hat.unsqueeze(1)
                 
-                # Match lengths of generated audio and target audio
                 min_len = min(y_hat.shape[-1], target_waveform.shape[-1])
                 y_hat = y_hat[:, :, :min_len]
                 y = target_waveform[:, :, :min_len]
 
-                # =================================================================
-                # 3. Train Discriminator
-                # =================================================================
+                # 2. Train Discriminator
                 optim_d.zero_grad()
-                
-                # MPD
                 y_d_rs, y_d_gs, _, _ = self.mpd(y, y_hat.detach())
                 loss_disc_f, _, _ = discriminator_loss(y_d_rs, y_d_gs)
-                
-                # MSD
                 y_ds_rs, y_ds_gs, _, _ = self.msd(y, y_hat.detach())
                 loss_disc_s, _, _ = discriminator_loss(y_ds_rs, y_ds_gs)
-                
                 loss_disc_all = loss_disc_f + loss_disc_s
                 loss_disc_all.backward()
                 optim_d.step()
 
-                # =================================================================
-                # 4. Train Generator
-                # =================================================================
+                # 3. Train Generator
                 optim_g.zero_grad()
 
-                # L1 Mel-Spectrogram Loss
-                min_mel_len = min(predicted_mel_clean.shape[1], labels.shape[1])
-                predicted_mel_clean_loss = predicted_mel_clean[:, :min_mel_len, :]
+                # --- THE FIX: Actual Reconstruction Gradient ---
+                y_hat_mel = self.mel_transform(y_hat.squeeze(1))
+                y_hat_mel = dynamic_range_compression_torch(y_hat_mel)
+                y_hat_mel = y_hat_mel.transpose(1, 2)
+
+                min_mel_len = min(y_hat_mel.shape[1], labels.shape[1])
+                y_hat_mel = y_hat_mel[:, :min_mel_len, :]
                 labels_clean = labels[:, :min_mel_len, :].clone()
                 labels_clean[labels_clean == -100.0] = 0.0
                 
-                # Compare the precomputed predicted mel against target mel
-                mel_loss = l1_criterion(predicted_mel_clean_loss, labels_clean)
+                mel_loss = l1_criterion(y_hat_mel, labels_clean)
 
-                # Adversarial Loss
+                # Adversarial
                 _, y_d_gs, fmap_rs, fmap_gs = self.mpd(y, y_hat)
                 loss_gen_f, _ = generator_loss(y_d_gs)
                 loss_fm_f = feature_loss(fmap_rs, fmap_gs)
@@ -356,13 +341,11 @@ class VocoderTrainer:
                 loss_gen_all.backward()
                 optim_g.step()
 
-                # Update progress bar
                 pbar.set_postfix({
-                    "D_Loss": f"{loss_disc_all.item():.4f}",
-                    "G_Loss": f"{loss_gen_all.item():.4f}"
+                    "D": f"{loss_disc_all.item():.2f}",
+                    "G": f"{loss_gen_all.item():.2f}",
+                    "Mel": f"{mel_loss.item():.4f}"
                 })
 
             if save_callback is not None:
                 save_callback(epoch + 1)
-
-        print("Vocoder fine-tuning complete!")

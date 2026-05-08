@@ -41,7 +41,7 @@ class SpeechT5WavLMDataset(Dataset):
         Args:
             paired_ds         : HuggingFace Dataset with columns ['input_values', 'labels']
             processor         : SpeechT5Processor (kept for potential fallback / tokenisation)
-            speaker_embeddings: 1-D tensor of shape (512,) — target-language x-vector
+            speaker_embeddings: 1-D tensor of shape (512,) — fallback target-language x-vector
         """
         self.paired_ds = paired_ds
         self.processor = processor
@@ -56,51 +56,46 @@ class SpeechT5WavLMDataset(Dataset):
         # ------------------------------------------------------------------
         # SOURCE: WavLM hidden states  (Seq_Len, 768)
         # ------------------------------------------------------------------
-        # The preprocessor saved numpy arrays of shape (Seq_Len, 768).
-        # They may arrive as a flat list or already as a 2-D numpy array.
         src_val = np.array(row["input_values"], dtype=np.float32)
         if src_val.ndim == 1:
-            # Flattened during serialisation — restore (Seq_Len, 768)
             if src_val.size % 768 == 0:
                 src_val = src_val.reshape(-1, 768)
             else:
-                raise ValueError(
-                    f"[Dataset] WavLM source has unexpected flat size {src_val.size}; "
-                    "not divisible by 768."
-                )
-        source_features = torch.tensor(src_val, dtype=torch.float32)  # (Seq_Len, 768)
+                raise ValueError(f"[Dataset] WavLM source has unexpected size {src_val.size}")
+        source_features = torch.tensor(src_val, dtype=torch.float32)
 
         # ------------------------------------------------------------------
         # TARGET: 80-bin log-mel spectrogram  (T, 80)
         # ------------------------------------------------------------------
-        # SpeechT5Processor saved shape (T, 80); deserialisation may produce
-        # (80, T) or a flat array — normalise to (T, 80) unconditionally.
         tgt_val = np.array(row["labels"], dtype=np.float32)
         if tgt_val.ndim == 1:
             if tgt_val.size % 80 == 0:
-                tgt_val = tgt_val.reshape(-1, 80)  # (T, 80)
+                tgt_val = tgt_val.reshape(-1, 80)
             else:
-                raise ValueError(
-                    f"[Dataset] Target mel has unexpected flat size {tgt_val.size}; "
-                    "not divisible by 80."
-                )
+                raise ValueError(f"[Dataset] Target mel has unexpected size {tgt_val.size}")
         elif tgt_val.ndim == 3:
-            tgt_val = tgt_val.squeeze(0)           # (1, T, 80) → (T, 80)
+            tgt_val = tgt_val.squeeze(0)
 
-        target_features = torch.tensor(tgt_val, dtype=torch.float32)  # (T, 80)
+        target_features = torch.tensor(tgt_val, dtype=torch.float32)
 
-        # Ensure time axis is first (SpeechT5 convention)
         if target_features.shape[0] == 80 and target_features.shape[1] != 80:
-            target_features = target_features.transpose(0, 1)         # (80, T) → (T, 80)
+            target_features = target_features.transpose(0, 1)
 
-        # SpeechT5 requires T to be divisible by reduction_factor (default=2)
         if target_features.shape[0] % 2 != 0:
-            target_features = target_features[:-1, :]                 # trim last frame
+            target_features = target_features[:-1, :]
+
+        # ------------------------------------------------------------------
+        # SPEAKER: 512-dim x-vector
+        # ------------------------------------------------------------------
+        if "speaker_embeddings" in row:
+            spk_emb = torch.tensor(row["speaker_embeddings"], dtype=torch.float32)
+        else:
+            spk_emb = self.speaker_embeddings
 
         return {
-            "input_values": source_features,      # (Seq_Len, 768)
-            "labels": target_features,            # (T, 80)
-            "speaker_embeddings": self.speaker_embeddings,
+            "input_values": source_features,
+            "labels": target_features,
+            "speaker_embeddings": spk_emb,
         }
 
 
@@ -136,6 +131,9 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.to(self.device)
         self.vocoder.to(self.device)
         self.target_embeddings = None
+
+        # Trainable Adapter/Projection layer to align WavLM space with SpeechT5
+        self.wavlm_proj = torch.nn.Linear(768, 768).to(self.device)
 
     def get_speaker_embedding(self, target_lang):
         print("Initializing X-Vector classifier for embedding extraction...")
@@ -187,6 +185,9 @@ class SpeechT5WavLM(torch.nn.Module):
         return encoder_obj
 
     def _encode_wavlm_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> BaseModelOutput:
+        # Align WavLM latent space to SpeechT5 transformer space
+        hidden_states = self.wavlm_proj(hidden_states)
+
         # Normalize WavLM features (SpeechT5 expects normalized features here)
         hidden_states = torch.nn.functional.layer_norm(hidden_states, [hidden_states.shape[-1]])
 
@@ -388,12 +389,16 @@ class SpeechT5WavLM(torch.nn.Module):
         # ------------------------------------------------------------------
         # 5. Optimiser
         # ------------------------------------------------------------------
+        # 5. Optimiser
         self.model.train()
+        self.wavlm_proj.train()
+
         optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
+            list(filter(lambda p: p.requires_grad, self.model.parameters())) +
+            list(self.wavlm_proj.parameters()),
             lr=learning_rate,
         )
-        
+
         # Calculate total optimization steps (accounting for gradient accumulation)
         total_steps = len(train_loader) * epochs // GRAD_ACCUM_STEPS
 
@@ -408,8 +413,8 @@ class SpeechT5WavLM(torch.nn.Module):
         )
 
         # L1 + MSE combined loss (element-wise, ignores padding frames)
-        l1_criterion  = torch.nn.L1Loss(reduction="mean")
-        mse_criterion = torch.nn.MSELoss(reduction="mean")
+        l1_criterion  = torch.nn.L1Loss(reduction="none")
+        mse_criterion = torch.nn.MSELoss(reduction="none")
 
         # ------------------------------------------------------------------
         # 6. Training loop
@@ -481,9 +486,23 @@ class SpeechT5WavLM(torch.nn.Module):
                     labels_m      = labels.clone()
                     labels_m[labels == -100.0] = 0.0                        # zero-out padding
 
-                    # L1 + MSE on both pre- and post-postnet predictions
-                    loss_pre  = l1_criterion(pred_before_m, labels_m) + mse_criterion(pred_before_m, labels_m)
-                    loss_post = l1_criterion(pred_after_m,  labels_m) + mse_criterion(pred_after_m,  labels_m)
+                    # 1. Calculate un-reduced, element-wise losses
+                    l1_pre_raw  = l1_criterion(pred_before_m, labels_m)
+                    mse_pre_raw = mse_criterion(pred_before_m, labels_m)
+                    l1_post_raw = l1_criterion(pred_after_m,  labels_m)
+                    mse_post_raw= mse_criterion(pred_after_m,  labels_m)
+
+                    # 2. Count exact number of valid scalar predictions
+                    # valid_mask_expanded is (B, T, 1). Summing it gives total valid timeframes.
+                    # Multiply by 80 (num_mel_bins) to get the true mathematical denominator.
+                    num_valid_elements = valid_mask_expanded.sum() * 80.0
+                    
+                    # Prevent division by zero in edge cases
+                    num_valid_elements = torch.clamp(num_valid_elements, min=1.0)
+
+                    # 3. Sum the loss and calculate the TRUE mean over valid speech
+                    loss_pre  = (l1_pre_raw.sum() + mse_pre_raw.sum()) / num_valid_elements
+                    loss_post = (l1_post_raw.sum() + mse_post_raw.sum()) / num_valid_elements
 
                     # Stop-token binary cross-entropy
                     stop_targets = (~valid_mask).float()                     # 1 at padding = stop
@@ -576,9 +595,11 @@ class SpeechT5WavLM(torch.nn.Module):
             print("Saved to 'speecht5_wavlm_vocoder_error'. Exiting safely.")
 
     def save(self, path):
+        os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))
         self.vocoder.save_pretrained(os.path.join(path, "vocoder"))
+        torch.save(self.wavlm_proj.state_dict(), os.path.join(path, "wavlm_proj.pth"))
         if self.target_embeddings is not None:
             np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
 
@@ -590,8 +611,15 @@ class SpeechT5WavLM(torch.nn.Module):
         else:
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained(model_path)
         
+        proj_path = os.path.join(path, "wavlm_proj.pth")
+        if os.path.exists(proj_path):
+            print("Loading WavLM projection layer...")
+            self.wavlm_proj.load_state_dict(torch.load(proj_path, map_location=self.device))
+
         self.model.to(self.device)
+        self.wavlm_proj.to(self.device)
         self.model.eval()
+        self.wavlm_proj.eval()
         
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
