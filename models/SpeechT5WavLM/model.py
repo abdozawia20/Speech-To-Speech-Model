@@ -130,6 +130,13 @@ class SpeechT5WavLM(torch.nn.Module):
 
         self.model.to(self.device)
         self.vocoder.to(self.device)
+
+        # CRITICAL OVERRIDE: High Resolution Setup (v6)
+        self.model.config.num_mel_bins = 128
+        self.vocoder.config.num_mel_bins = 128
+        self.vocoder.config.hop_length = 256
+        self.vocoder.config.win_length = 1024
+
         self.target_embeddings = None
 
         # Trainable Adapter/Projection layer to align WavLM space with SpeechT5
@@ -290,7 +297,11 @@ class SpeechT5WavLM(torch.nn.Module):
 
             mel = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)
             mel = mel + self.model.speech_decoder_postnet.postnet(mel)
-            speech = self.vocoder(mel).squeeze()
+            
+            # --- THE FIX: Precise Official Denormalization ---
+            vocoder_input = (mel * 2.0) - 5.0
+            
+            speech = self.vocoder(vocoder_input).squeeze()
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
@@ -624,3 +635,7 @@ class SpeechT5WavLM(torch.nn.Module):
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
             self.target_embeddings = torch.tensor(np.load(emb_path))
+ath = os.path.join(path, "speaker_embedding.npy")
+        if os.path.exists(emb_path):
+            self.target_embeddings = torch.tensor(np.load(emb_path))
+))

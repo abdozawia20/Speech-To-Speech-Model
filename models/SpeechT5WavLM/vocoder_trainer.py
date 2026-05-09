@@ -198,15 +198,15 @@ class SpeechT5VocoderDataset(Dataset):
         waveform = row["target_waveform"].float().unsqueeze(0) # (1, T)
 
         if predicted_mel.ndim == 1:
-            predicted_mel = predicted_mel.reshape(-1, 80)
+            predicted_mel = predicted_mel.reshape(-1, 128)
 
         if target_features.ndim == 1:
-            if target_features.numel() % 80 == 0:
-                target_features = target_features.reshape(-1, 80)
+            if target_features.numel() % 128 == 0:
+                target_features = target_features.reshape(-1, 128)
         elif target_features.ndim == 3:
             target_features = target_features.squeeze(0)
 
-        if target_features.shape[0] == 80 and target_features.shape[1] != 80:
+        if target_features.shape[0] == 128 and target_features.shape[1] != 128:
             target_features = target_features.transpose(0, 1)
 
         if target_features.shape[0] % 2 != 0:
@@ -241,6 +241,11 @@ class VocoderTrainer:
     def __init__(self, model, vocoder, device, target_embeddings):
         self.model = model
         self.vocoder = vocoder
+
+        # CRITICAL OVERRIDE: Force standard 16ms resolution
+        self.vocoder.config.hop_length = 256
+        self.vocoder.config.win_length = 1024
+
         self.device = device
         self.target_embeddings = target_embeddings
 
@@ -253,11 +258,12 @@ class VocoderTrainer:
             n_fft=1024,
             win_length=1024,
             hop_length=256,
-            f_min=80.0,
-            f_max=7600.0,
+            f_min=0.0,
+            f_max=8000.0,
             n_mels=80,
             mel_scale="htk",
         ).to(device)
+
 
     def train(self, preprocessed_path, epochs, learning_rate, batch_size, save_callback=None):
         print("Initializing Vocoder Trainer...")
@@ -294,8 +300,13 @@ class VocoderTrainer:
                 predicted_mel_clean = predicted_mel.clone()
                 predicted_mel_clean[predicted_mel == -100.0] = 0.0
 
-                # 1. Generator Forward
-                y_hat = self.vocoder(predicted_mel_clean)
+                # --- THE FIX: Precise Official Denormalization ---
+                # Dataset is (log_mel - (-5)) / 2.
+                vocoder_input = (predicted_mel_clean * 2.0) - 5.0
+
+
+                # 1. Generator Forward (Expects B, T, 80)
+                y_hat = self.vocoder(vocoder_input)
                 if y_hat.ndim == 2:
                     y_hat = y_hat.unsqueeze(1)
                 
@@ -316,9 +327,13 @@ class VocoderTrainer:
                 # 3. Train Generator
                 optim_g.zero_grad()
 
-                # --- THE FIX: Actual Reconstruction Gradient ---
+                # --- THE FIX: Actual Reconstruction Gradient with Matching Normalization ---
                 y_hat_mel = self.mel_transform(y_hat.squeeze(1))
                 y_hat_mel = dynamic_range_compression_torch(y_hat_mel)
+                
+                # APPLY SAME NORMALIZATION AS PREPROCESSOR
+                y_hat_mel = (y_hat_mel - (-10.0)) / 4.0
+                
                 y_hat_mel = y_hat_mel.transpose(1, 2)
 
                 min_mel_len = min(y_hat_mel.shape[1], labels.shape[1])
@@ -349,3 +364,11 @@ class VocoderTrainer:
 
             if save_callback is not None:
                 save_callback(epoch + 1)
+
+  "G": f"{loss_gen_all.item():.2f}",
+                    "Mel": f"{mel_loss.item():.4f}"
+                })
+
+            if save_callback is not None:
+                save_callback(epoch + 1)
+

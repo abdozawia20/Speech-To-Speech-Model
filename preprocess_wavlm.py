@@ -125,9 +125,9 @@ def _get_mel_transform():
             n_fft=1024,
             win_length=1024,
             hop_length=256,
-            f_min=80.0,
-            f_max=7600.0,
-            n_mels=80,
+            f_min=0.0,          # Full range
+            f_max=8000.0,       # Full range for 16kHz
+            n_mels=80,          # Standard for pre-trained weights
             mel_scale="htk",
         )
     return _MEL_TRANSFORM
@@ -281,7 +281,7 @@ def preprocess_and_save_wavlm():
     # ------------------------------------------------------------------
     out_path = os.path.join(
         OUTPUT_DIR,
-        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v4",
+        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v7",
     )
     print(f"Saving paired dataset to {out_path}...")
     paired_ds.save_to_disk(out_path)

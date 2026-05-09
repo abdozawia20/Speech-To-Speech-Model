@@ -75,12 +75,13 @@ def _get_mel_transform():
             n_fft=1024,
             win_length=1024,
             hop_length=256,
-            f_min=80.0,
-            f_max=7600.0,
+            f_min=0.0,
+            f_max=8000.0,
             n_mels=80,
             mel_scale="htk",
         )
     return _MEL_TRANSFORM
+
 
 
 def process_source_wavlm(batch):
@@ -124,8 +125,8 @@ def process_target_vocoder(batch):
 
         # 1. Mel + Normalization
         mel = mel_transform(waveform)
-        log_mel = torch.log(torch.clamp(mel, min=1e-5))
-        log_mel = (log_mel - (-5.0)) / 2.0
+        log_mel = torch.log(torch.clamp(mel, min=1e-10))
+        log_mel = (log_mel - (-10.0)) / 4.0
         log_mel = log_mel.T
         mel_list.append(log_mel.numpy())
 
