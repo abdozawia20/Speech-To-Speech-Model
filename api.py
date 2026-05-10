@@ -151,7 +151,7 @@ class ModelManager:
         if name == "speecht5_wavlm":
             from models.SpeechT5WavLM.model import SpeechT5WavLM
             model = SpeechT5WavLM()
-            ckpt_path = os.path.join(PROJECT_ROOT, "models", "SpeechT5WavLM", "speecht5_wavlm_en_de_v2")
+            ckpt_path = os.path.join(PROJECT_ROOT, "models", "SpeechT5WavLM", "speecht5_wavlm_en_de_v2026_05_08_002")
             logger.info(f"Loading weights from: {ckpt_path}")
             model.load(ckpt_path)
             if model.target_embeddings is None:

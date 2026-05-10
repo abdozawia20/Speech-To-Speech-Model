@@ -1,16 +1,19 @@
 import os
 import torch
+import torchaudio
 import numpy as np
-from faster_whisper import WhisperModel
 import dataset_loader
+
+# Fix for speechbrain dependency on torchaudio.list_audio_backends
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: ["soundfile"]
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-dataset_loader.NUM_PROC = 4
+dataset_loader.NUM_PROC = 1
 SOURCE_LANG = "en"
 TARGET_LANG = "de"
-MAX_DURATION_SECONDS = 8.0
 OUTPUT_DIR = dataset_loader.DATASETS_DIR
 
 # WavLM model for SOURCE encoding (English → continuous hidden states)
@@ -22,60 +25,10 @@ SPEECHT5_MODEL_NAME = "microsoft/speecht5_vc"
 # ---------------------------------------------------------------------------
 # Global state for worker processes
 # ---------------------------------------------------------------------------
-language_model = None          # Whisper language detector (language filter step)
 _wavlm_proc_cache = None       # Wav2Vec2FeatureExtractor for WavLM
 _wavlm_model_cache = None      # Frozen WavLMModel backbone
 _speecht5_proc_cache = None    # SpeechT5Processor (mel-spectrogram extractor)
-
-
-# ---------------------------------------------------------------------------
-# Worker utilities — language detection
-# ---------------------------------------------------------------------------
-
-def compute_duration(batch):
-    """Calculate duration of audio clips in batch."""
-    durations = []
-    for x in batch["audio"]:
-        durations.append(len(x["array"]) / x["sampling_rate"])
-    return {"duration": durations}
-
-
-def check_language(batch, expected_lang):
-    """
-    Detect the language of each audio clip using faster-whisper and return
-    a boolean column 'is_valid_lang'.
-    """
-    global language_model
-
-    if language_model is None:
-        try:
-            print(f"Loading Whisper model in worker (PID: {os.getpid()})...")
-            language_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        except Exception as e:
-            print(f"Warning: Failed to load Whisper model in worker: {e}")
-            return {"is_valid_lang": [True] * len(batch["audio"])}
-
-    is_valid = []
-    for x in batch["audio"]:
-        audio = x["array"]
-        sr = x["sampling_rate"]
-
-        if sr != 16000:
-            import librosa
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-
-        try:
-            segments, info = language_model.transcribe(
-                audio,
-                beam_size=1,
-                language=None,
-                task="transcribe",
-            )
-            is_valid.append(info.language == expected_lang)
-        except Exception:
-            is_valid.append(True)  # keep on transcription error
-
-    return {"is_valid_lang": is_valid}
+_spk_model_cache = None        # SpeechBrain X-Vector model
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +55,21 @@ def _get_wavlm_model():
         _wavlm_model_cache.eval()
         
     return _wavlm_proc_cache, _wavlm_model_cache
+
+
+def _get_spk_model():
+    """Lazy-load the SpeechBrain x-vector model for speaker embedding extraction."""
+    global _spk_model_cache
+    if _spk_model_cache is None:
+        from speechbrain.inference.speaker import EncoderClassifier
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading X-Vector model on {device}...")
+        _spk_model_cache = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-xvect-voxceleb",
+            savedir="tmp_spkrec",
+            run_opts={"device": str(device)}
+        )
+    return _spk_model_cache
 
 
 def process_source_wavlm(batch):
@@ -157,9 +125,9 @@ def _get_mel_transform():
             n_fft=1024,
             win_length=1024,
             hop_length=256,
-            f_min=80.0,
-            f_max=7600.0,
-            n_mels=80,
+            f_min=0.0,          # Full range
+            f_max=8000.0,       # Full range for 16kHz
+            n_mels=80,          # Standard for pre-trained weights
             mel_scale="htk",
         )
     return _MEL_TRANSFORM
@@ -167,23 +135,25 @@ def _get_mel_transform():
 
 def process_target_mel(batch):
     """
-    MODALITY BRIDGE — Target (German audio → 80-bin log-mel spectrogram).
+    MODALITY BRIDGE — Target (German audio → 80-bin log-mel spectrogram + Speaker Embedding).
 
-    Uses the exact MelSpectrogram parameters from SpeechT5's internal
-    feature extraction pipeline, followed by log compression, so that
-    the stored 'labels' are in the same space the decoder is trained to predict.
+    Extracts:
+      - 'labels': Normalized 80-bin log-mel spectrogram (T, 80)
+      - 'speaker_embeddings': 512-dim x-vector for the specific sample
 
-    Output shape per sample: (T, 80)
-      • T = number of mel frames  (hop_length=256 → ~62.5 frames/sec)
-      • 80 mel bins
-
-    Stored under the key 'labels' so the training loop can compute L1/MSE
-    between the predicted mel and the ground-truth mel.
+    Normalization:
+      SpeechT5's decoder converges faster when log-mels are roughly zero-mean.
+      We apply a standard shift and scale.
     """
     import torch
+    import numpy as np
     mel_transform = _get_mel_transform()
+    spk_model = _get_spk_model()
+    device = spk_model.device
 
     mel_list = []
+    spk_embeds = []
+    
     for audio_item in batch["audio"]:
         audio_array = np.array(audio_item["array"], dtype=np.float32)
         sr = audio_item["sampling_rate"]
@@ -193,20 +163,25 @@ def process_target_mel(batch):
             import librosa
             audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
 
-        waveform = torch.from_numpy(audio_array)  # (N,)
+        waveform = torch.from_numpy(audio_array)
 
-        # mel_transform expects (N,) or (1, N) and returns (80, T)
-        mel = mel_transform(waveform)              # (80, T)
-
-        # Apply log compression (same as SpeechT5 internals)
-        log_mel = torch.log(torch.clamp(mel, min=1e-5))  # (80, T)
-
-        # Transpose to (T, 80) — time-major format expected by the decoder
-        log_mel = log_mel.T                        # (T, 80)
-
+        # 1. Mel Spectrogram (T, 80)
+        mel = mel_transform(waveform)
+        log_mel = torch.log(torch.clamp(mel, min=1e-5))
+        
+        # Normalization (Approximate SpeechT5 distribution)
+        log_mel = (log_mel - (-5.0)) / 2.0
+        log_mel = log_mel.T  # (T, 80)
         mel_list.append(log_mel.numpy())
 
-    return {"labels": mel_list}
+        # 2. Speaker Embedding (512,)
+        with torch.no_grad():
+            input_wav = waveform.unsqueeze(0).to(device)
+            emb = spk_model.encode_batch(input_wav)
+            emb = torch.nn.functional.normalize(emb, dim=2).squeeze().cpu()
+            spk_embeds.append(emb.numpy())
+
+    return {"labels": mel_list, "speaker_embeddings": spk_embeds}
 
 
 # ---------------------------------------------------------------------------
@@ -226,22 +201,19 @@ def preprocess_and_save_wavlm():
         Saved under key: 'labels'
 
     Both modalities are merged into a single Arrow dataset with columns:
-        ['input_values', 'labels']
+        ['input_values', 'labels', 'speaker_embeddings']
 
     This unified layout avoids the need for two separate language directories
     and simplifies DataLoader logic: one row = one aligned (EN, DE) pair.
 
     Output directory:
-        processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v2/
-            ← Arrow dataset with 'input_values' and 'labels' columns
+        processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v4/
+            ← Arrow dataset with 'input_values', 'labels', 'speaker_embeddings'
     """
     print(f"--- Hybrid WavLM/SpeechT5 Preprocessing {SOURCE_LANG} -> {TARGET_LANG} ---")
     print(f"  Source modality : WavLM hidden states ({WAVLM_MODEL_NAME})")
-    print(f"  Target modality : 80-bin mel-spectrogram ({SPEECHT5_MODEL_NAME})")
-    print(f"  Max Duration    : {MAX_DURATION_SECONDS}s")
+    print(f"  Target modality : 80-bin mel-spectrogram + x-vector")
 
-    # num_proc=1 is safest when loading heavy neural net models inside
-    # worker processes via fork; avoids CUDA context clashes and OOM.
     num_proc = 1
     print(f"Using {num_proc} CPU worker(s) (conservative for model-based encoding).")
 
@@ -252,117 +224,64 @@ def preprocess_and_save_wavlm():
     datasets = dataset_loader.load_data(
         lang=[SOURCE_LANG, TARGET_LANG],
         split="train",
-        dataset=["seamless_align"],
-        num_samples=15000,
+        dataset=["fleurs"],
+        num_samples=20000,
     )
 
-    source_ds = datasets[SOURCE_LANG]
-    target_ds = datasets[TARGET_LANG]
+    source_ds = datasets.get(SOURCE_LANG)
+    target_ds = datasets.get(TARGET_LANG)
 
-    # Align lengths so every row is a valid (EN, DE) pair
+    if source_ds is None or target_ds is None:
+        print(f"ERROR: Could not load one or both datasets ({SOURCE_LANG}, {TARGET_LANG}).")
+        return
+
+    # Align lengths
     min_len = min(len(source_ds), len(target_ds))
     source_ds = source_ds.select(range(min_len))
     target_ds = target_ds.select(range(min_len))
     print(f"Initial aligned pairs: {min_len}")
 
     # ------------------------------------------------------------------
-    # 2. Filter by Duration
+    # 2. SOURCE: Encode English audio → WavLM hidden states (input_values)
     # ------------------------------------------------------------------
-    print("Calculating durations...")
-    source_ds = source_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Source Durations")
-    target_ds = target_ds.map(compute_duration, batched=True, num_proc=num_proc, desc="Calc Target Durations")
-
-    print(f"Filtering samples > {MAX_DURATION_SECONDS}s...")
-    src_durs = np.array(source_ds["duration"])
-    tgt_durs = np.array(target_ds["duration"])
-    valid_mask = (src_durs <= MAX_DURATION_SECONDS) & (tgt_durs <= MAX_DURATION_SECONDS)
-    valid_indices = np.where(valid_mask)[0]
-
-    print(f"Kept {len(valid_indices)} / {min_len} samples (Duration Filter).")
-    source_ds = source_ds.select(valid_indices)
-    target_ds = target_ds.select(valid_indices)
-    source_ds = source_ds.remove_columns(["duration"])
-    target_ds = target_ds.remove_columns(["duration"])
-
-    # ------------------------------------------------------------------
-    # 3. Filter by Language (Whisper Detection)
-    # ------------------------------------------------------------------
-    print("Filtering by Language (Whisper Detection)...")
-    source_ds = source_ds.map(
-        check_language,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": SOURCE_LANG},
-        desc=f"Checking Source Language ({SOURCE_LANG})",
-    )
-    target_ds = target_ds.map(
-        check_language,
-        batched=True,
-        batch_size=8,
-        num_proc=num_proc,
-        fn_kwargs={"expected_lang": TARGET_LANG},
-        desc=f"Checking Target Language ({TARGET_LANG})",
-    )
-
-    src_valid = np.array(source_ds["is_valid_lang"])
-    tgt_valid = np.array(target_ds["is_valid_lang"])
-    lang_mask = src_valid & tgt_valid
-    lang_valid_indices = np.where(lang_mask)[0]
-
-    print(f"Kept {len(lang_valid_indices)} / {len(source_ds)} samples (Language Filter).")
-    source_ds = source_ds.select(lang_valid_indices)
-    target_ds = target_ds.select(lang_valid_indices)
-    source_ds = source_ds.remove_columns(["is_valid_lang"])
-    target_ds = target_ds.remove_columns(["is_valid_lang"])
-
-    # ------------------------------------------------------------------
-    # 4. SOURCE: Encode English audio → WavLM hidden states (input_values)
-    # ------------------------------------------------------------------
-    print("Encoding SOURCE (EN) with frozen WavLM → hidden states (Seq_Len, 768)...")
+    print("Encoding SOURCE (EN) with frozen WavLM → hidden states...")
     source_ds = source_ds.map(
         process_source_wavlm,
         batched=True,
-        batch_size=64,        # small batch to keep RAM usage bounded
+        batch_size=64,
         num_proc=num_proc,
         desc="WavLM Encoding Source Audio",
-        remove_columns=["audio"],  # drop raw waveform to save disk space
+        remove_columns=["audio"],
     )
 
     # ------------------------------------------------------------------
-    # 5. TARGET: Encode German audio → 80-bin mel-spectrogram (labels)
+    # 3. TARGET: Encode German audio → 80-bin mel-spectrogram + X-Vector
     # ------------------------------------------------------------------
-    print("Encoding TARGET (DE) with SpeechT5Processor → 80-bin mel-spectrogram (T, 80)...")
+    print("Encoding TARGET (DE) → 80-bin mel-spectrogram + X-Vector...")
     target_ds = target_ds.map(
         process_target_mel,
         batched=True,
         batch_size=16,
         num_proc=num_proc,
-        desc="SpeechT5 Mel Encoding Target Audio",
-        remove_columns=["audio"],  # drop raw waveform to save disk space
+        desc="Target Mel + X-Vector Encoding",
+        remove_columns=["audio"],
     )
 
     # ------------------------------------------------------------------
-    # 6. Merge into a single paired dataset
+    # 4. Merge into a single paired dataset
     # ------------------------------------------------------------------
-    # Both datasets now have the same number of rows (aligned pairs).
-    # We add the 'labels' column from target_ds into source_ds so the
-    # result is a single dataset with columns ['input_values', 'labels'].
-    print("Merging source hidden states and target mel-spectrograms...")
-    
-    # Remove overlapping columns (metadata like 'id', 'transcription', etc.) 
-    # from target_ds to avoid duplicate column errors during axis=1 merge.
+    print("Merging source and target features...")
     target_ds = target_ds.remove_columns([c for c in target_ds.column_names if c in source_ds.column_names])
     
     from datasets import concatenate_datasets
     paired_ds = concatenate_datasets([source_ds, target_ds], axis=1)
 
     # ------------------------------------------------------------------
-    # 7. Save to Disk
+    # 5. Save to Disk
     # ------------------------------------------------------------------
     out_path = os.path.join(
         OUTPUT_DIR,
-        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v2",
+        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v7",
     )
     print(f"Saving paired dataset to {out_path}...")
     paired_ds.save_to_disk(out_path)
