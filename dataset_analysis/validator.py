@@ -1,10 +1,32 @@
 import os
+import sys
+
+# Programmatically add nvidia-cudnn and nvidia-cublas to LD_LIBRARY_PATH
+# faster-whisper/ctranslate2 requires these to be in the library search path
+# This must happen before importing libraries that use CUDA
+try:
+    import nvidia.cudnn
+    import nvidia.cublas
+    cudnn_path = os.path.join(nvidia.cudnn.__path__[0], "lib")
+    cublas_path = os.path.join(nvidia.cublas.__path__[0], "lib")
+    
+    if os.path.exists(cudnn_path) and os.path.exists(cublas_path):
+        current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        paths_to_add = [cudnn_path, cublas_path]
+        
+        new_paths = [p for p in paths_to_add if p not in current_ld_path]
+        if new_paths:
+            os.environ["LD_LIBRARY_PATH"] = ":".join(new_paths + ([current_ld_path] if current_ld_path else []))
+            # Some libraries require the environment variable to be set before the process starts.
+            # However, for dynamically loaded libraries (dlopen), this often works if set before the load.
+except ImportError:
+    pass
+
 import json
 import torch
 import numpy as np
 from faster_whisper import WhisperModel
 import jiwer
-import sys
 
 # Ensure root is in path for dataset_loader
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -17,23 +39,45 @@ MODEL_SIZE = 'base'
 RESULTS_FILE = 'dataset_analysis/fleurs_validation_results.json'
 
 class FleursSemanticValidator:
-    def __init__(self, model_size=MODEL_SIZE):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = WhisperModel(model_size, device=device, compute_type="float32" if device == "cpu" else "float16")
+    def __init__(self, model_size=MODEL_SIZE, device=None):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self.device = device
+        print(f"Initializing Whisper model ({model_size}) on {self.device}...")
+        
+        try:
+            compute_type = "float32" if self.device == "cpu" else "float16"
+            self.model = WhisperModel(model_size, device=self.device, compute_type=compute_type)
+        except Exception as e:
+            if self.device == "cuda":
+                print(f"CUDA initialization failed: {e}. Falling back to CPU...")
+                self.device = "cpu"
+                self.model = WhisperModel(model_size, device="cpu", compute_type="float32")
+            else:
+                raise e
+                
         self.results = {}
         self.load_results()
 
     def load_results(self):
         if os.path.exists(RESULTS_FILE):
-            with open(RESULTS_FILE, 'r') as f:
-                self.results = json.load(f)
-            print(f"Loaded {len(self.results)} existing records.")
+            try:
+                with open(RESULTS_FILE, 'r') as f:
+                    self.results = json.load(f)
+                print(f"Loaded {len(self.results)} existing records.")
+            except Exception as e:
+                print(f"Warning: Failed to load existing results: {e}")
+                self.results = {}
 
     def save_results(self):
         tmp_file = RESULTS_FILE + ".tmp"
-        with open(tmp_file, 'w') as f:
-            json.dump(self.results, f, indent=2)
-        os.rename(tmp_file, RESULTS_FILE)
+        try:
+            with open(tmp_file, 'w') as f:
+                json.dump(self.results, f, indent=2)
+            os.rename(tmp_file, RESULTS_FILE)
+        except Exception as e:
+            print(f"Error saving results: {e}")
 
     def normalize_text(self, text):
         return jiwer.transforms.Compose([
@@ -125,6 +169,13 @@ class FleursSemanticValidator:
         print(f"Avg DE WER: {avg_de:.4f}")
 
 if __name__ == "__main__":
-    validator = FleursSemanticValidator()
+    import argparse
+    parser = argparse.ArgumentParser(description="FLEURS Semantic Validator")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU mode")
+    parser.add_argument("--samples", type=int, default=None, help="Number of samples to process")
+    args = parser.parse_args()
+
+    device = "cpu" if args.cpu else None
+    validator = FleursSemanticValidator(device=device)
     # Run validation
-    validator.run(num_samples=None)
+    validator.run(num_samples=args.samples)

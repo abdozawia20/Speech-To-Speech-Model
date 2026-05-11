@@ -108,29 +108,19 @@ def process_source_wavlm(batch):
 # TARGET modality: 80-bin log-mel spectrogram  (German audio → [T, 80])
 # ---------------------------------------------------------------------------
 
-# SpeechT5's exact mel-spectrogram parameters (from modeling_speecht5.py)
-_MEL_TRANSFORM = None
+def _get_speecht5_processor():
+    """Lazy-load and cache the official SpeechT5Processor."""
+    global _speecht5_proc_cache
+    if _speecht5_proc_cache is None:
+        from transformers import SpeechT5Processor
+        print(f"Loading SpeechT5 Processor in worker (PID: {os.getpid()})...")
+        _speecht5_proc_cache = SpeechT5Processor.from_pretrained(SPEECHT5_MODEL_NAME)
+    return _speecht5_proc_cache
 
-def _get_mel_transform():
-    """
-    Lazy-load and cache the torchaudio MelSpectrogram transform using
-    SpeechT5's exact parameters so the stored mel-spectrograms match
-    what the decoder expects.
-    """
-    global _MEL_TRANSFORM
-    if _MEL_TRANSFORM is None:
-        import torchaudio
-        _MEL_TRANSFORM = torchaudio.transforms.MelSpectrogram(
-            sample_rate=16000,
-            n_fft=1024,
-            win_length=1024,
-            hop_length=256,
-            f_min=0.0,          # Full range
-            f_max=8000.0,       # Full range for 16kHz
-            n_mels=80,          # Standard for pre-trained weights
-            mel_scale="htk",
-        )
-    return _MEL_TRANSFORM
+
+# ---------------------------------------------------------------------------
+# SOURCE modality: WavLM hidden states  (English → [Seq_Len, 768])
+# ---------------------------------------------------------------------------
 
 
 def process_target_mel(batch):
@@ -138,16 +128,12 @@ def process_target_mel(batch):
     MODALITY BRIDGE — Target (German audio → 80-bin log-mel spectrogram + Speaker Embedding).
 
     Extracts:
-      - 'labels': Normalized 80-bin log-mel spectrogram (T, 80)
+      - 'labels': Official normalized 80-bin log-mel spectrogram (T, 80)
       - 'speaker_embeddings': 512-dim x-vector for the specific sample
-
-    Normalization:
-      SpeechT5's decoder converges faster when log-mels are roughly zero-mean.
-      We apply a standard shift and scale.
     """
     import torch
     import numpy as np
-    mel_transform = _get_mel_transform()
+    processor = _get_speecht5_processor()
     spk_model = _get_spk_model()
     device = spk_model.device
 
@@ -155,26 +141,25 @@ def process_target_mel(batch):
     spk_embeds = []
     
     for audio_item in batch["audio"]:
-        audio_array = np.array(audio_item["array"], dtype=np.float32)
+        audio_array = np.array(audio_item["array"], dtype=np.float32).flatten()
         sr = audio_item["sampling_rate"]
 
-        # Resample to 16 kHz if needed
-        if sr != 16000:
-            import librosa
-            audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
-
-        waveform = torch.from_numpy(audio_array)
-
-        # 1. Mel Spectrogram (T, 80)
-        mel = mel_transform(waveform)
-        log_mel = torch.log(torch.clamp(mel, min=1e-5))
-        
-        # Normalization (Approximate SpeechT5 distribution)
-        log_mel = (log_mel - (-5.0)) / 2.0
-        log_mel = log_mel.T  # (T, 80)
+        # 1. Official Mel Spectrogram (T, 80)
+        # The processor handles resampling, mel-extraction, and normalization.
+        inputs = processor(audio_target=audio_array, sampling_rate=sr, return_tensors="pt")
+        # Squeeze batch dim -> (T, 80)
+        log_mel = inputs.input_values[0]
         mel_list.append(log_mel.numpy())
 
         # 2. Speaker Embedding (512,)
+        # For Speaker Embeddings, we still need 16kHz
+        if sr != 16000:
+            import librosa
+            audio_array_16k = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+        else:
+            audio_array_16k = audio_array
+
+        waveform = torch.from_numpy(audio_array_16k)
         with torch.no_grad():
             input_wav = waveform.unsqueeze(0).to(device)
             emb = spk_model.encode_batch(input_wav)
@@ -188,7 +173,7 @@ def process_target_mel(batch):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def preprocess_and_save_wavlm():
+def preprocess_and_save_wavlm(use_perfected=False, num_samples=None):
     """
     Hybrid preprocessing pipeline.
 
@@ -202,15 +187,9 @@ def preprocess_and_save_wavlm():
 
     Both modalities are merged into a single Arrow dataset with columns:
         ['input_values', 'labels', 'speaker_embeddings']
-
-    This unified layout avoids the need for two separate language directories
-    and simplifies DataLoader logic: one row = one aligned (EN, DE) pair.
-
-    Output directory:
-        processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v4/
-            ← Arrow dataset with 'input_values', 'labels', 'speaker_embeddings'
     """
-    print(f"--- Hybrid WavLM/SpeechT5 Preprocessing {SOURCE_LANG} -> {TARGET_LANG} ---")
+    suffix = "_perfected" if use_perfected else ""
+    print(f"--- Hybrid WavLM/SpeechT5 Preprocessing {SOURCE_LANG} -> {TARGET_LANG}{suffix} ---")
     print(f"  Source modality : WavLM hidden states ({WAVLM_MODEL_NAME})")
     print(f"  Target modality : 80-bin mel-spectrogram + x-vector")
 
@@ -220,16 +199,28 @@ def preprocess_and_save_wavlm():
     # ------------------------------------------------------------------
     # 1. Load Raw Data
     # ------------------------------------------------------------------
-    print("Loading raw datasets...")
-    datasets = dataset_loader.load_data(
-        lang=[SOURCE_LANG, TARGET_LANG],
-        split="train",
-        dataset=["fleurs"],
-        num_samples=20000,
-    )
-
-    source_ds = datasets.get(SOURCE_LANG)
-    target_ds = datasets.get(TARGET_LANG)
+    if use_perfected:
+        from datasets import load_from_disk
+        print(f"Loading perfected datasets from disk...")
+        en_path = os.path.join(dataset_loader.DATASETS_DIR, "speech_t5_perfected", "en")
+        de_path = os.path.join(dataset_loader.DATASETS_DIR, "speech_t5_perfected", "de")
+        
+        source_ds = load_from_disk(en_path)
+        target_ds = load_from_disk(de_path)
+        
+        if num_samples:
+            source_ds = source_ds.select(range(min(num_samples, len(source_ds))))
+            target_ds = target_ds.select(range(min(num_samples, len(target_ds))))
+    else:
+        print("Loading raw FLEURS datasets...")
+        datasets = dataset_loader.load_data(
+            lang=[SOURCE_LANG, TARGET_LANG],
+            split="train",
+            dataset=["fleurs"],
+            num_samples=num_samples or 20000,
+        )
+        source_ds = datasets.get(SOURCE_LANG)
+        target_ds = datasets.get(TARGET_LANG)
 
     if source_ds is None or target_ds is None:
         print(f"ERROR: Could not load one or both datasets ({SOURCE_LANG}, {TARGET_LANG}).")
@@ -251,7 +242,7 @@ def preprocess_and_save_wavlm():
         batch_size=64,
         num_proc=num_proc,
         desc="WavLM Encoding Source Audio",
-        remove_columns=["audio"],
+        remove_columns=[c for c in source_ds.column_names if c != "id"], # Keep ID for verification
     )
 
     # ------------------------------------------------------------------
@@ -264,14 +255,15 @@ def preprocess_and_save_wavlm():
         batch_size=16,
         num_proc=num_proc,
         desc="Target Mel + X-Vector Encoding",
-        remove_columns=["audio"],
+        remove_columns=[c for c in target_ds.column_names if c != "id"],
     )
 
     # ------------------------------------------------------------------
     # 4. Merge into a single paired dataset
     # ------------------------------------------------------------------
     print("Merging source and target features...")
-    target_ds = target_ds.remove_columns([c for c in target_ds.column_names if c in source_ds.column_names])
+    # Keep ID from source, remove from target
+    target_ds = target_ds.remove_columns(["id"])
     
     from datasets import concatenate_datasets
     paired_ds = concatenate_datasets([source_ds, target_ds], axis=1)
@@ -279,9 +271,10 @@ def preprocess_and_save_wavlm():
     # ------------------------------------------------------------------
     # 5. Save to Disk
     # ------------------------------------------------------------------
+    version = "v8_perfected" if use_perfected else "v8"
     out_path = os.path.join(
         OUTPUT_DIR,
-        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_v7",
+        f"processed_wavlm_{SOURCE_LANG}_{TARGET_LANG}_{version}",
     )
     print(f"Saving paired dataset to {out_path}...")
     paired_ds.save_to_disk(out_path)
@@ -290,7 +283,88 @@ def preprocess_and_save_wavlm():
     print(f"  Samples      : {len(paired_ds)}")
     print(f"  Columns      : {paired_ds.column_names}")
     print(f"  Output path  : {out_path}")
+    return out_path
+
+
+def verify_preprocessing(dataset_path, num_verify=3):
+    """
+    Verifies preprocessing by reconstructing audio from the stored mel-spectrograms.
+    Uses the pre-trained SpeechT5 Hifi-GAN vocoder for high-quality reconstruction.
+    """
+    from datasets import load_from_disk
+    from transformers import SpeechT5HifiGan
+    import soundfile as sf
+    import torch
+    
+    print(f"\n--- Verifying Preprocessing with Hifi-GAN ({num_verify} samples) ---")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    try:
+        print(f"Loading SpeechT5 Hifi-GAN vocoder on {device}...")
+        vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device)
+        vocoder.eval()
+    except Exception as e:
+        print(f"Error loading Hifi-GAN: {e}. Falling back to Griffin-Lim (lower quality)...")
+        return _verify_preprocessing_griffin_lim(dataset_path, num_verify)
+
+    ds = load_from_disk(dataset_path)
+    indices = range(min(num_verify, len(ds)))
+    
+    os.makedirs("verification_audio", exist_ok=True)
+    
+    for i in indices:
+        sample = ds[i]
+        sample_id = sample.get("id", i)
+        
+        # 1. Prepare Target (DE) mel-spectrogram
+        mel_array = np.array(sample["labels"], dtype=np.float32)
+        mel = torch.from_numpy(mel_array).to(device) # (T, 80)
+        
+        # Vocoder expects (Batch, Seq_Len, 80)
+        with torch.no_grad():
+            waveform = vocoder(mel.unsqueeze(0))
+            waveform = waveform.squeeze().cpu().numpy()
+        
+        out_file = f"verification_audio/sample_{sample_id}_de_hifigan.wav"
+        sf.write(out_file, waveform, 16000)
+        print(f"  Saved high-quality reconstructed target: {out_file}")
+
+    print("\nHigh-quality verification audio saved in 'verification_audio/'.")
+    print("Listen to these samples to confirm the features are ready for training.")
+
+
+def _verify_preprocessing_griffin_lim(dataset_path, num_verify=3):
+    """Fallback Griffin-Lim reconstruction."""
+    from datasets import load_from_disk
+    import librosa
+    import soundfile as sf
+    
+    ds = load_from_disk(dataset_path)
+    indices = range(min(num_verify, len(ds)))
+    
+    for i in indices:
+        sample = ds[i]
+        sample_id = sample.get("id", i)
+        mel_array = np.array(sample["labels"], dtype=np.float32)
+        mel = torch.from_numpy(mel_array).T # (80, T)
+        log_mel = (mel * 2.0) + (-5.0)
+        mel_unlogged = torch.exp(log_mel)
+        
+        audio_recon = librosa.feature.inverse.mel_to_audio(
+            mel_unlogged.numpy(),
+            sr=16000,
+            n_fft=1024,
+            hop_length=256,
+            win_length=1024
+        )
+        
+        out_file = f"verification_audio/sample_{sample_id}_de_griffin.wav"
+        sf.write(out_file, audio_recon, 16000)
+        print(f"  Saved fallback reconstructed target: {out_file}")
 
 
 if __name__ == "__main__":
-    preprocess_and_save_wavlm()
+    path = preprocess_and_save_wavlm(use_perfected=False, num_samples=10000)
+    if path:
+        verify_preprocessing(path, num_verify=3)
