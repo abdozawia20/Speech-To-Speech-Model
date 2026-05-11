@@ -30,6 +30,7 @@ class Conv1DBridge(nn.Module):
     Temporally aware bridge between WavLM (50Hz) and SpeechT5.
     Uses a sliding window (kernel_size=5) to give the attention mechanism
     surrounding acoustic context, smoothing out the alignment matrix.
+    Incorporates a Residual Bypass to ensure 100% feature passthrough on Epoch 1.
     """
     def __init__(self, dim=768, kernel_size=5):
         super().__init__()
@@ -46,8 +47,15 @@ class Conv1DBridge(nn.Module):
         # Conv1d expects shape (Batch, Channels, Sequence Length)
         # WavLM outputs shape (Batch, Sequence Length, Channels)
         x = x.transpose(1, 2)
+        residual = x
+
+        # Apply layers
         x = self.norm1(self.act1(self.conv1(x)))
         x = self.norm2(self.act2(self.conv2(x)))
+
+        # Residual connection ensures features pass through even if layers are zeroed
+        x = x + residual
+
         # Transpose back to SpeechT5 format
         return x.transpose(1, 2)
 
@@ -220,10 +228,29 @@ class SpeechT5WavLM(torch.nn.Module):
         return encoder_obj
 
     def _encode_wavlm_states(self, hidden_states, attention_mask=None):
-        # 1. Pass through the new Conv1D Bridge
+        # 1. Pass through the Conv1D Bridge
         projected_states = self.wavlm_proj(hidden_states)
 
-        # 2. Mock the BaseModelOutput for SpeechT5
+        # ---------------------------------------------------------
+        # 2. THE POSITIONAL ENCODING FIX
+        # We must add SpeechT5's native temporal awareness back into the 
+        # features so the cross-attention matrix knows left from right.
+        # ---------------------------------------------------------
+        encoder = self.model.speecht5.encoder
+        
+        # pos_conv_embed expects shape: (Batch, Channels, SeqLen)
+        hidden_for_pos = projected_states.transpose(1, 2)
+        pos_embeds = encoder.pos_conv_embed(hidden_for_pos)
+        pos_embeds = pos_embeds.transpose(1, 2)
+        
+        # Add the temporal positional information
+        projected_states = projected_states + pos_embeds
+        
+        # Apply the native LayerNorm to stabilize the variance for the Decoder
+        projected_states = encoder.layer_norm(projected_states)
+        # ---------------------------------------------------------
+
+        # 3. Mock the BaseModelOutput for SpeechT5
         from transformers.modeling_outputs import BaseModelOutput
         return BaseModelOutput(
             last_hidden_state=projected_states,
@@ -413,13 +440,15 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.train()
         self.wavlm_proj.train()
 
-        # --- THE DIRAC HACK ---
-        # Initialize Conv1D kernels as Dirac delta functions (Convolutional Identity).
-        # This passes the WavLM features straight through untouched on Epoch 1,
-        # preventing the optimizer from panicking and "playing dead".
+        # --- THE RESIDUAL BYPASS HACK ---
+        # 1. Initialize Conv1 as Dirac (Identity)
         nn.init.dirac_(self.wavlm_proj.conv1.weight)
         nn.init.zeros_(self.wavlm_proj.conv1.bias)
-        nn.init.dirac_(self.wavlm_proj.conv2.weight)
+
+        # 2. Initialize Conv2 as ZERO
+        # This makes the entire bridge output exactly 0 + residual on Epoch 1.
+        # This bypasses the GELU/BatchNorm distortion completely!
+        nn.init.zeros_(self.wavlm_proj.conv2.weight)
         nn.init.zeros_(self.wavlm_proj.conv2.bias)
 
         # Disable dropout during the 1-sample overfit to establish base alignment
