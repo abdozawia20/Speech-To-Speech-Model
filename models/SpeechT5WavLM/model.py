@@ -230,31 +230,27 @@ class SpeechT5WavLM(torch.nn.Module):
         # 1. Pass through the Conv1D Bridge
         projected_states = self.wavlm_proj(hidden_states)
         
-        # ---------------------------------------------------------
-        # 2. THE POSITIONAL ENCODING FIX (CORRECTED PATHS)
-        # ---------------------------------------------------------
+        # 2. Access encoder components
         encoder = self.model.speecht5.encoder
-        
-        # Access nested components safely
         prenet = encoder.prenet if hasattr(encoder, "prenet") else encoder
         transformer_enc = encoder.wrapped_encoder if hasattr(encoder, "wrapped_encoder") else encoder
         
-        # pos_conv_embed (SpeechT5PositionalConvEmbedding) handles its own transposes 
-        # internally and expects shape: (Batch, SeqLen, HiddenSize).
-        # It ALSO adds the input to the positional embeddings, so we DO NOT add it again manually.
+        # 3. Apply Positional Convolutional Embedding
+        # projected_states shape: (Batch, Seq, Dim)
         projected_states = prenet.pos_conv_embed(projected_states)
         
-        # Apply the native LayerNorm to stabilize the variance for the Decoder
+        # 4. Apply LayerNorm
         projected_states = transformer_enc.layer_norm(projected_states)
-        # ---------------------------------------------------------
-
-        # 3. Mock the BaseModelOutput for SpeechT5
-        from transformers.modeling_outputs import BaseModelOutput
-        return BaseModelOutput(
-            last_hidden_state=projected_states,
-            hidden_states=None,
-            attentions=None
+        
+        # 5. THE FIX: Pass through the Transformer stack
+        # We need to call the actual transformer layers
+        encoder_outputs = transformer_enc(
+            inputs_embeds=projected_states,
+            attention_mask=attention_mask,
+            return_dict=True
         )
+        
+        return encoder_outputs
 
     def run_inference(self, audio_array, sampling_rate, speaker_embedding=None,
                       threshold=0.5, minlenratio=0.0, maxlenratio=1.2):
