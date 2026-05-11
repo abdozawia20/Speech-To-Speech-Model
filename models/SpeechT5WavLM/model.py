@@ -70,16 +70,18 @@ class SpeechT5WavLMDataset(Dataset):
     This avoids maintaining two separate language directories and ensures that
     every (source, target) pair is always correctly aligned.
     """
-    def __init__(self, paired_ds, processor, speaker_embeddings):
+    def __init__(self, paired_ds, processor, speaker_embeddings, coarse_mode=False):
         """
         Args:
             paired_ds         : HuggingFace Dataset with columns ['input_values', 'labels']
             processor         : SpeechT5Processor (kept for potential fallback / tokenisation)
             speaker_embeddings: 1-D tensor of shape (512,) — fallback target-language x-vector
+            coarse_mode       : bool, whether to apply temporal average pooling (coarse-to-fine training)
         """
         self.paired_ds = paired_ds
         self.processor = processor
         self.speaker_embeddings = speaker_embeddings
+        self.coarse_mode = coarse_mode
 
     def __len__(self):
         return len(self.paired_ds)
@@ -117,6 +119,21 @@ class SpeechT5WavLMDataset(Dataset):
 
         if target_features.shape[0] % 2 != 0:
             target_features = target_features[:-1, :]
+
+        # ------------------------------------------------------------------
+        # COARSE MODE: Temporal Average Pooling (Downsample by 2)
+        # ------------------------------------------------------------------
+        if self.coarse_mode:
+            # For WavLM (Seq, 768) -> pooling along Seq dimension
+            # AvgPool1d expects (Batch, Channels, Seq)
+            source_features = source_features.transpose(0, 1).unsqueeze(0) # (1, 768, Seq)
+            source_features = torch.nn.functional.avg_pool1d(source_features, kernel_size=2, stride=2)
+            source_features = source_features.squeeze(0).transpose(0, 1) # (Seq/2, 768)
+
+            # For Mel-spectrogram (T, 80) -> pooling along T dimension
+            target_features = target_features.transpose(0, 1).unsqueeze(0) # (1, 80, T)
+            target_features = torch.nn.functional.avg_pool1d(target_features, kernel_size=2, stride=2)
+            target_features = target_features.squeeze(0).transpose(0, 1) # (T/2, 80)
 
         # ------------------------------------------------------------------
         # SPEAKER: 512-dim x-vector
@@ -245,7 +262,7 @@ class SpeechT5WavLM(torch.nn.Module):
         # 5. THE FIX: Pass through the Transformer stack
         # We need to call the actual transformer layers
         encoder_outputs = transformer_enc(
-            inputs_embeds=projected_states,
+            hidden_states=projected_states,
             attention_mask=attention_mask,
             return_dict=True
         )
@@ -404,48 +421,126 @@ class SpeechT5WavLM(torch.nn.Module):
             return speech.cpu().numpy(), spectrogram.squeeze().cpu().numpy()
         return speech.cpu().numpy()
 
-    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5):
+    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, coarse_mode, start_epoch=0, total_epochs_label=None):
         """
-        Fine-tune the hybrid WavLM → SpeechT5 pipeline.
-
-        Architecture overview
-        ---------------------
-        1. INPUT  : WavLM hidden states  (B, Seq_Len, 768)  — pre-computed by preprocessor
-        2. ENCODER: SpeechT5 transformer encoder receives the WavLM states directly,
-                    bypassing its native CNN feature extractor entirely.
-        3. DECODER: SpeechT5 autoregressive spectrogram decoder.
-        4. LOSS   : L1 + MSE between predicted mel-spectrogram and target mel-spectrogram
-                    (80-bin, computed by SpeechT5Processor during preprocessing).
-
-        Why bypass the CNN?
-        -------------------
-        SpeechT5's CNN front-end was designed to process raw 16-kHz waveforms into
-        a 768-dim frame sequence.  WavLM already does this (and does it better for
-        cross-lingual tasks), so feeding WavLM states directly into the transformer
-        encoder avoids a redundant and potentially lossy second convolution stage.
-
-        Why L1 + MSE?
-        -------------
-        L1 encourages sharp spectral detail (robust to outliers), while MSE penalises
-        large deviations strongly.  Their sum has been shown empirically to yield
-        cleaner spectrograms than either alone for TTS / VC tasks.
+        Internal method to handle a single training phase (Coarse or Fine).
         """
-        from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
+        if epochs <= 0:
+            return
 
+        phase_name = "COARSE" if coarse_mode else "FINE"
+        print(f"\n>>> Starting {phase_name} Training Phase ({epochs} epochs)")
+
+        # 1. Setup Dataset and DataLoader
+        train_dataset = SpeechT5WavLMDataset(
+            paired_ds,
+            self.processor,
+            self.target_embeddings,
+            coarse_mode=coarse_mode
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=wavlm_speecht5_collate_fn,
+            num_workers=2,
+            pin_memory=True,
+        )
+
+        # 2. Setup Optimizer and training state
+        self.model.train()
+        self.wavlm_proj.train()
+
+        # --- THE OVERFIT HACK: DISABLE STOCHASTICITY ---
+        for m in self.model.modules():
+            if "Dropout" in m.__class__.__name__:
+                m.eval()
+
+        trainable_params = (
+            list(filter(lambda p: p.requires_grad, self.model.parameters())) +
+            list(self.wavlm_proj.parameters())
+        )
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=learning_rate,
+        )
+
+        # 3. Epoch Loop
+        try:
+            for epoch_idx in range(epochs):
+                actual_epoch = start_epoch + epoch_idx + 1
+                display_total = total_epochs_label if total_epochs_label else epochs
+                
+                epoch_loss = 0.0
+                num_batches = 0
+                optimizer.zero_grad()
+
+                pbar = tqdm(train_loader, desc=f"[{phase_name}] Epoch {actual_epoch}/{display_total}")
+
+                for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
+                    input_values       = input_values.to(self.device)
+                    attention_mask     = attention_mask.to(self.device).long()
+                    labels             = labels.to(self.device)
+                    speaker_embeddings = speaker_embeddings.to(self.device)
+
+                    # MODALITY BRIDGE: WavLM states → SpeechT5 transformer
+                    encoder_out = self._encode_wavlm_states(input_values, attention_mask)
+
+                    # NATIVE LOSS: Use SpeechT5's built-in loss calculation (includes stop token)
+                    # NOTE: labels padding (-100) is handled correctly by MSELoss if we mask it,
+                    # but HF's native loss expects it to be handled or ignored.
+                    # For safety with MSE, we ensure no -100 remains in labels.
+                    labels[labels == -100.0] = 0.0
+
+                    outputs = self.model(
+                        input_values=None,
+                        speaker_embeddings=speaker_embeddings,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                        encoder_outputs=encoder_out,
+                        return_dict=True,
+                    )
+                    
+                    loss = outputs.loss
+                    (loss / self.GRAD_ACCUM_STEPS).backward()
+
+                    if (step + 1) % self.GRAD_ACCUM_STEPS == 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        if hasattr(self, "wavlm_proj"):
+                            torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                    epoch_loss += loss.item()
+                    num_batches += 1
+                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                    
+                    del encoder_out, outputs, loss
+
+                avg_loss = epoch_loss / max(num_batches, 1)
+                print(f"[{phase_name}] Epoch {actual_epoch} Avg Loss: {avg_loss:.4f}")
+                
+                if actual_epoch % saving_checkpoint == 0:
+                    self.save(f"checkpoint_epoch_{actual_epoch}")
+
+        except KeyboardInterrupt:
+            print(f"\nTraining interrupted during {phase_name} phase!")
+            raise
+
+    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5, coarse_epochs=0):
+        """
+        Fine-tune the hybrid WavLM → SpeechT5 pipeline using a two-phase Coarse-to-Fine approach.
+        """
         print("Starting WavLM+SpeechT5 fine-tuning (Hybrid Architecture).")
 
-        # ------------------------------------------------------------------
         # 1. Load the unified paired dataset
-        # ------------------------------------------------------------------
         print(f"Loading preprocessed data from {preprocessed_path}...")
-        # The new preprocessor saves a SINGLE dataset with columns
-        # ['input_values', 'labels'] — no language sub-directories.
         if os.path.exists(os.path.join(preprocessed_path, "dataset_info.json")):
-            # Unified paired dataset (v2 format)
             paired_ds = load_from_disk(preprocessed_path)
             target_lang = self._target_lang if hasattr(self, '_target_lang') else "de"
         else:
-            # Legacy v1 format: two language sub-directories — convert on the fly
             print("Detected legacy v1 format — merging language directories...")
             sub_dirs = sorted([
                 d for d in os.listdir(preprocessed_path)
@@ -461,211 +556,36 @@ class SpeechT5WavLM(torch.nn.Module):
             paired_ds = paired_ds.add_column("labels", labels_list)
 
         print(f"Loaded {len(paired_ds)} aligned (source, target) pairs.")
-        print(f"Dataset columns: {paired_ds.column_names}")
 
-        # ------------------------------------------------------------------
         # 2. Speaker embedding
-        # ------------------------------------------------------------------
         if self.target_embeddings is None:
             self.get_speaker_embedding(target_lang)
 
-        # ------------------------------------------------------------------
         # 3. Freeze the SpeechT5 CNN feature encoder
-        #    (irrelevant for our pipeline but prevents accidental gradient
-        #    flow if the model is ever called with raw waveforms elsewhere)
-        # ------------------------------------------------------------------
-        print("Freezing SpeechT5 CNN feature encoder (not used in hybrid path).")
+        print("Freezing SpeechT5 CNN feature encoder.")
         self.model.freeze_feature_encoder()
 
-        # ------------------------------------------------------------------
-        # 4. Build DataLoader
-        # ------------------------------------------------------------------
-        train_dataset = SpeechT5WavLMDataset(
-            paired_ds,
-            self.processor,
-            self.target_embeddings,
-        )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            collate_fn=wavlm_speecht5_collate_fn,
-            num_workers=2,     # keep low; dataset reads are cheap (pre-encoded)
-            pin_memory=True,
-        )
-
-        # ------------------------------------------------------------------
-        # 5. Optimiser
-        # ------------------------------------------------------------------
-        # 5. Optimiser
-        self.model.train()
-        self.wavlm_proj.train()
-
-        # --- THE OVERFIT HACK: DISABLE STOCHASTICITY ---
-        # Disable all Dropout variants (Spatial, standard, etc.) AFTER .train()
-        # This forces the model into a deterministic state for memorisation.
-        for m in self.model.modules():
-            if "Dropout" in m.__class__.__name__:
-                m.eval()
-
-        # --- THE RESIDUAL BYPASS HACK ---
-        # 1. Initialize Conv1 as Dirac (Identity)
+        # 4. Initialize Projection (Residual Bypass Hack)
+        # Ensure the bridge starts close to an identity mapping
         nn.init.dirac_(self.wavlm_proj.conv1.weight)
         nn.init.zeros_(self.wavlm_proj.conv1.bias)
-
-        # 2. Initialize Conv2 as ZERO
-        # This makes the entire bridge output exactly 0 + residual on Epoch 1.
-        # This bypasses the GELU/BatchNorm distortion completely!
         nn.init.zeros_(self.wavlm_proj.conv2.weight)
         nn.init.zeros_(self.wavlm_proj.conv2.bias)
 
-        # Ensure the Conv1D Bridge parameters are included in the optimizer
-        trainable_params = (
-            list(filter(lambda p: p.requires_grad, self.model.parameters())) +
-            list(self.wavlm_proj.parameters())
-        )
-
-        optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=learning_rate,
-        )
-
-        # Skip the warmup scheduler for overfit tests to ensure Step 1 starts at max LR
-        # total_steps = (len(train_loader) * epochs) // self.GRAD_ACCUM_STEPS
-        # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*total_steps), num_training_steps=total_steps)
-
-        # L1 + MSE combined loss (element-wise, ignores padding frames)
-        l1_criterion  = torch.nn.L1Loss(reduction="none")
-        mse_criterion = torch.nn.MSELoss(reduction="none")
-
-        # ------------------------------------------------------------------
-        # 6. Training loop
-        # ------------------------------------------------------------------
+        total_epochs = coarse_epochs + epochs
+        
         try:
-            for epoch in range(epochs):
-                epoch_loss = 0.0
-                num_batches = 0
-                optimizer.zero_grad()
+            # PHASE A: Coarse Training
+            if coarse_epochs > 0:
+                self._train_phase(paired_ds, coarse_epochs, learning_rate, batch_size, saving_checkpoint, 
+                                  coarse_mode=True, start_epoch=0, total_epochs_label=total_epochs)
+                print("\n>>> Phase A (Coarse) complete. Transitioning to Phase B (Fine)...")
+            
+            # PHASE B: Fine-grained Training
+            self._train_phase(paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, 
+                              coarse_mode=False, start_epoch=coarse_epochs, total_epochs_label=total_epochs)
 
-                pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
-
-                for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
-                    # Move all tensors to device
-                    input_values       = input_values.to(self.device)        # (B, Seq_Len, 768)
-                    attention_mask     = attention_mask.to(self.device).long() # (B, Seq_Len)
-                    labels             = labels.to(self.device)              # (B, T, 80)
-                    speaker_embeddings = speaker_embeddings.to(self.device)  # (B, 512)
-
-                    # -------------------------------------------------------
-                    # MODALITY BRIDGE: WavLM states → SpeechT5 transformer
-                    #
-                    # _encode_wavlm_states() feeds input_values directly into
-                    # the SpeechT5 *transformer* encoder (self-attention stack),
-                    # completely bypassing the CNN feature extractor that would
-                    # normally process raw waveforms.  The output is a
-                    # BaseModelOutput with last_hidden_state shape (B, Seq, 768)
-                    # that the SpeechT5 decoder cross-attends to.
-                    # -------------------------------------------------------
-                    encoder_out = self._encode_wavlm_states(input_values, attention_mask)
-
-                    # Teacher-forced decoder input: shift target mel right by one frame
-                    decoder_input_values, decoder_attention_mask = shift_spectrograms_right(
-                        labels, self.model.config.reduction_factor, None
-                    )
-
-                    # Full SpeechT5 model forward pass with pre-computed encoder states
-                    # 'encoder_outputs' tells SpeechT5 to skip its own encoder and use
-                    # our WavLM-derived encoder_out directly.
-                    outputs = self.model.speecht5(
-                        encoder_outputs=encoder_out,          # skip CNN + transformer encoder
-                        attention_mask=attention_mask,
-                        decoder_input_values=decoder_input_values,
-                        decoder_attention_mask=decoder_attention_mask,
-                        speaker_embeddings=speaker_embeddings,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-
-                    # Postnet: projects decoder hidden states → mel-spectrogram frames
-                    # Returns (pre_postnet_mel, post_postnet_mel, stop_token_logits)
-                    outputs_before_postnet, outputs_after_postnet, stop_logits = (
-                        self.model.speech_decoder_postnet(outputs.last_hidden_state)
-                    )
-
-                    # Build a valid-frame mask from the mel padding sentinel (-100)
-                    # so padding frames don't contribute to the loss.
-                    valid_mask = (labels != -100.0).any(dim=-1)              # (B, T)
-                    valid_mask_expanded = valid_mask.unsqueeze(-1).float()   # (B, T, 1)
-
-                    # Trim predicted sequences to the length of the target
-                    T_tgt = labels.shape[1]
-                    pred_before = outputs_before_postnet[:, :T_tgt, :]      # (B, T, 80)
-                    pred_after  = outputs_after_postnet[:, :T_tgt, :]       # (B, T, 80)
-
-                    # 1. Calculate un-reduced, element-wise losses (masking out padding)
-                    # We compute the raw loss first, then multiply by the valid_mask_expanded (0 for padding)
-                    l1_pre_raw  = l1_criterion(pred_before, labels) * valid_mask_expanded
-                    mse_pre_raw = mse_criterion(pred_before, labels) * valid_mask_expanded
-                    l1_post_raw = l1_criterion(pred_after, labels) * valid_mask_expanded
-                    mse_post_raw= mse_criterion(pred_after, labels) * valid_mask_expanded
-
-                    # 2. Count exact number of valid scalar predictions
-                    # valid_mask_expanded is (B, T, 1). Summing it gives total valid timeframes.
-                    # Multiply by 80 (num_mel_bins) to get the true mathematical denominator.
-                    num_valid_elements = valid_mask_expanded.sum() * 80.0
-                    
-                    # Prevent division by zero in edge cases
-                    num_valid_elements = torch.clamp(num_valid_elements, min=1.0)
-
-                    # 3. Sum the loss and calculate the TRUE mean over valid speech
-                    loss_pre  = (l1_pre_raw.sum() + mse_pre_raw.sum()) / num_valid_elements
-                    loss_post = (l1_post_raw.sum() + mse_post_raw.sum()) / num_valid_elements
-
-                    # --- THE STOP TOKEN FIX ---
-                    # Guarantee the model sees a '1' at the exact end of speech
-                    stop_targets = torch.zeros_like(valid_mask, dtype=torch.float)
-                    valid_lengths = valid_mask.sum(dim=1).long()
-                    
-                    for i, length in enumerate(valid_lengths):
-                        if length > 0:
-                            # The last valid frame and any padding after it is marked as STOP
-                            stop_targets[i, length-1:] = 1.0
-
-                    loss_stop = torch.nn.functional.binary_cross_entropy_with_logits(
-                        stop_logits[:, :T_tgt].squeeze(-1),
-                        stop_targets,
-                    )
-
-                    # Lower stop-token pressure to prioritize spectrogram learning
-                    loss = loss_pre + loss_post + 0.1 * loss_stop
-
-                    (loss / self.GRAD_ACCUM_STEPS).backward()
-
-                    if (step + 1) % self.GRAD_ACCUM_STEPS == 0:
-                        # 1. Clip the main model
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        
-                        # 2. CRITICAL: Clip your custom projection layer too!
-                        if hasattr(self, 'wavlm_proj'):
-                            torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                    current_loss = loss.item()
-                    epoch_loss  += current_loss
-                    num_batches += 1
-                    pbar.set_postfix({"loss": f"{current_loss:.4f}",
-                                      "l1_pre": f"{loss_pre.item():.4f}",
-                                      "l1_post": f"{loss_post.item():.4f}"})
-
-                    # Free intermediate tensors explicitly each step
-                    del encoder_out, outputs, pred_before, pred_after, loss
-
-                avg_loss = epoch_loss / max(num_batches, 1)
-                print(f"Epoch {epoch+1}/{epochs}  Avg Loss: {avg_loss:.4f}")
-                if (epoch + 1) % saving_checkpoint == 0:
-                    self.save(f"checkpoint_epoch_{epoch+1}")
+            print("\nTraining completed successfully.")
 
         except KeyboardInterrupt:
             print("\nTraining interrupted! Saving current progress...")
