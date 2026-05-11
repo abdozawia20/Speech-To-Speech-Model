@@ -27,37 +27,35 @@ from speechbrain.inference.speaker import EncoderClassifier
 
 class Conv1DBridge(nn.Module):
     """
-    Temporally aware bridge between WavLM (50Hz) and SpeechT5.
-    Uses a sliding window (kernel_size=5) to give the attention mechanism
-    surrounding acoustic context, smoothing out the alignment matrix.
-    Incorporates a Residual Bypass to ensure 100% feature passthrough on Epoch 1.
+    Revised Bridge using LayerNorm for BATCH_SIZE=1 stability.
     """
     def __init__(self, dim=768, kernel_size=5):
         super().__init__()
-        # Padding ensures the sequence length remains exactly the same
         padding = kernel_size // 2
         self.conv1 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
         self.act1 = nn.GELU()
-        self.norm1 = nn.BatchNorm1d(dim)
+        self.norm1 = nn.LayerNorm(dim)
+        
         self.conv2 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
         self.act2 = nn.GELU()
-        self.norm2 = nn.BatchNorm1d(dim)
+        self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, x):
-        # Conv1d expects shape (Batch, Channels, Sequence Length)
-        # WavLM outputs shape (Batch, Sequence Length, Channels)
-        x = x.transpose(1, 2)
+        # x shape: (Batch, Seq, Dim)
         residual = x
+        
+        # Conv1d expects (Batch, Dim, Seq)
+        x = x.transpose(1, 2)
+        x = self.conv1(x)
+        x = x.transpose(1, 2)
+        x = self.norm1(self.act1(x))
+        
+        x = x.transpose(1, 2)
+        x = self.conv2(x)
+        x = x.transpose(1, 2)
+        x = self.norm2(self.act2(x))
 
-        # Apply layers
-        x = self.norm1(self.act1(self.conv1(x)))
-        x = self.norm2(self.act2(self.conv2(x)))
-
-        # Residual connection ensures features pass through even if layers are zeroed
-        x = x + residual
-
-        # Transpose back to SpeechT5 format
-        return x.transpose(1, 2)
+        return x + residual
 
 
 class SpeechT5WavLMDataset(Dataset):
@@ -155,6 +153,7 @@ class SpeechT5WavLM(torch.nn.Module):
         super().__init__()
         
         self.wavlm_model_name = wavlm_model_name
+        self.GRAD_ACCUM_STEPS = 1
         print(f"Loading SpeechT5WavLM components (WavLM={wavlm_model_name})...")
         
         self.processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
@@ -230,24 +229,23 @@ class SpeechT5WavLM(torch.nn.Module):
     def _encode_wavlm_states(self, hidden_states, attention_mask=None):
         # 1. Pass through the Conv1D Bridge
         projected_states = self.wavlm_proj(hidden_states)
-
+        
         # ---------------------------------------------------------
-        # 2. THE POSITIONAL ENCODING FIX
-        # We must add SpeechT5's native temporal awareness back into the 
-        # features so the cross-attention matrix knows left from right.
+        # 2. THE POSITIONAL ENCODING FIX (CORRECTED PATHS)
         # ---------------------------------------------------------
         encoder = self.model.speecht5.encoder
         
-        # pos_conv_embed expects shape: (Batch, Channels, SeqLen)
-        hidden_for_pos = projected_states.transpose(1, 2)
-        pos_embeds = encoder.pos_conv_embed(hidden_for_pos)
-        pos_embeds = pos_embeds.transpose(1, 2)
+        # Access nested components safely
+        prenet = encoder.prenet if hasattr(encoder, "prenet") else encoder
+        transformer_enc = encoder.wrapped_encoder if hasattr(encoder, "wrapped_encoder") else encoder
         
-        # Add the temporal positional information
-        projected_states = projected_states + pos_embeds
+        # pos_conv_embed (SpeechT5PositionalConvEmbedding) handles its own transposes 
+        # internally and expects shape: (Batch, SeqLen, HiddenSize).
+        # It ALSO adds the input to the positional embeddings, so we DO NOT add it again manually.
+        projected_states = prenet.pos_conv_embed(projected_states)
         
         # Apply the native LayerNorm to stabilize the variance for the Decoder
-        projected_states = encoder.layer_norm(projected_states)
+        projected_states = transformer_enc.layer_norm(projected_states)
         # ---------------------------------------------------------
 
         # 3. Mock the BaseModelOutput for SpeechT5
@@ -259,7 +257,7 @@ class SpeechT5WavLM(torch.nn.Module):
         )
 
     def run_inference(self, audio_array, sampling_rate, speaker_embedding=None,
-                      threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
+                      threshold=0.5, minlenratio=0.0, maxlenratio=1.2):
 
         self.model.eval()
         self.vocoder.eval()
@@ -300,35 +298,29 @@ class SpeechT5WavLM(torch.nn.Module):
             encoder_states = encoder_out.last_hidden_state
 
             # 5. THE FIX: Let Hugging Face handle the complex auto-regressive generation
-            # Note: SpeechT5's generate_speech hardcodes the CNN encoder pass. 
-            # We temporarily mock the CNN encoder to bypass it and return your WavLM states!
             original_encoder = self.model.speecht5.encoder
             
             class MockEncoder(torch.nn.Module):
-                def forward(self, input_values, attention_mask, return_dict):
-                    return encoder_out
+                def __init__(self, encoder_out):
+                    super().__init__()
+                    self.encoder_out = encoder_out
+                def forward(self, input_values, attention_mask=None, return_dict=True):
+                    return self.encoder_out
                 @property
                 def main_input_name(self):
                     return "input_values"
                     
-            self.model.speecht5.encoder = MockEncoder()
+            self.model.speecht5.encoder = MockEncoder(encoder_out)
             
-            # generate_speech requires an input_values tensor to determine the sequence length
-            # for the attention mask. 
-            # 1. THE BLIND MASK FIX: Use ones, not zeros! 
-            # (pad_token_id is 0, so zeros would make the attention mask blind the model).
+            # Use dummy_input matching the encoder sequence length directly.
+            # Since we use a MockEncoder, the internal CNN subsampling is bypassed.
             dummy_input = torch.ones((1, encoder_states.shape[1]), dtype=torch.float32, device=self.device)
             
-            # 2. THE DROPOUT RE-INJECTION
-            # Force the prenet dropout to remain ACTIVE to break the deterministic loop
-            for module in self.model.speecht5.decoder.prenet.modules():
-                if isinstance(module, torch.nn.Dropout):
-                    module.train()
-
             try:
                 speech = self.model.generate_speech(
                     dummy_input,
                     speaker_embeddings=emb,
+                    attention_mask=attention_mask,
                     threshold=threshold,
                     minlenratio=minlenratio,
                     maxlenratio=maxlenratio,
@@ -340,6 +332,81 @@ class SpeechT5WavLM(torch.nn.Module):
             speech = speech.squeeze()
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
+
+    def infer(self, wavlm_hidden_states, speaker_embeddings, threshold=0.5, minlenratio=0.0, maxlenratio=1.2, return_spectrogram=False):
+        """
+        Perform autoregressive inference using pre-computed WavLM features.
+        
+        Args:
+            wavlm_hidden_states: Tensor of shape (Seq, 768) or (1, Seq, 768)
+            speaker_embeddings: Tensor of shape (512,) or (1, 512)
+        """
+        self.model.eval()
+        self.vocoder.eval()
+        self.wavlm_proj.eval()
+
+        # Handle shapes
+        if wavlm_hidden_states.ndim == 2:
+            wavlm_hidden_states = wavlm_hidden_states.unsqueeze(0)
+        if speaker_embeddings.ndim == 1:
+            speaker_embeddings = speaker_embeddings.unsqueeze(0)
+
+        wavlm_hidden_states = wavlm_hidden_states.to(self.device)
+        speaker_embeddings = speaker_embeddings.to(self.device)
+
+        # Attention mask: all 1s
+        attention_mask = torch.ones(wavlm_hidden_states.shape[:2], dtype=torch.long, device=self.device)
+
+        with torch.no_grad():
+            encoder_out = self._encode_wavlm_states(wavlm_hidden_states, attention_mask)
+            
+            original_encoder = self.model.speecht5.encoder
+            
+            class MockEncoder(torch.nn.Module):
+                def __init__(self, encoder_out):
+                    super().__init__()
+                    self.encoder_out = encoder_out
+                def forward(self, input_values, attention_mask=None, return_dict=True):
+                    return self.encoder_out
+                @property
+                def main_input_name(self):
+                    return "input_values"
+                    
+            self.model.speecht5.encoder = MockEncoder(encoder_out)
+            
+            # Dummy input matching the encoder sequence length
+            dummy_input = torch.ones((1, wavlm_hidden_states.shape[1]), dtype=torch.float32, device=self.device)
+            
+            try:
+                if return_spectrogram:
+                    spectrogram = self.model.generate_speech(
+                        dummy_input,
+                        speaker_embeddings=speaker_embeddings,
+                        attention_mask=attention_mask,
+                        threshold=threshold,
+                        minlenratio=minlenratio,
+                        maxlenratio=maxlenratio,
+                        vocoder=None
+                    )
+                    speech = self.vocoder(spectrogram)
+                else:
+                    speech = self.model.generate_speech(
+                        dummy_input,
+                        speaker_embeddings=speaker_embeddings,
+                        attention_mask=attention_mask,
+                        threshold=threshold,
+                        minlenratio=minlenratio,
+                        maxlenratio=maxlenratio,
+                        vocoder=self.vocoder
+                    )
+            finally:
+                self.model.speecht5.encoder = original_encoder
+                
+            speech = speech.squeeze()
+
+        if return_spectrogram:
+            return speech.cpu().numpy(), spectrogram.squeeze().cpu().numpy()
+        return speech.cpu().numpy()
 
     def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5):
         """
@@ -370,7 +437,6 @@ class SpeechT5WavLM(torch.nn.Module):
         from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
 
         print("Starting WavLM+SpeechT5 fine-tuning (Hybrid Architecture).")
-        GRAD_ACCUM_STEPS = 1
 
         # ------------------------------------------------------------------
         # 1. Load the unified paired dataset
@@ -440,6 +506,13 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.train()
         self.wavlm_proj.train()
 
+        # --- THE OVERFIT HACK: DISABLE STOCHASTICITY ---
+        # Disable all Dropout variants (Spatial, standard, etc.) AFTER .train()
+        # This forces the model into a deterministic state for memorisation.
+        for m in self.model.modules():
+            if "Dropout" in m.__class__.__name__:
+                m.eval()
+
         # --- THE RESIDUAL BYPASS HACK ---
         # 1. Initialize Conv1 as Dirac (Identity)
         nn.init.dirac_(self.wavlm_proj.conv1.weight)
@@ -450,11 +523,6 @@ class SpeechT5WavLM(torch.nn.Module):
         # This bypasses the GELU/BatchNorm distortion completely!
         nn.init.zeros_(self.wavlm_proj.conv2.weight)
         nn.init.zeros_(self.wavlm_proj.conv2.bias)
-
-        # Disable dropout during the 1-sample overfit to establish base alignment
-        for module in self.model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
 
         # Ensure the Conv1D Bridge parameters are included in the optimizer
         trainable_params = (
@@ -467,18 +535,9 @@ class SpeechT5WavLM(torch.nn.Module):
             lr=learning_rate,
         )
 
-        # Calculate total optimization steps (accounting for gradient accumulation)
-        total_steps = len(train_loader) * epochs // GRAD_ACCUM_STEPS
-
-        # Set warmup to 0 for brute-force overfit testing
-        warmup_steps = 0
-
-        # Initialize the new scheduler
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, 
-            num_warmup_steps=warmup_steps, 
-            num_training_steps=total_steps
-        )
+        # Skip the warmup scheduler for overfit tests to ensure Step 1 starts at max LR
+        # total_steps = (len(train_loader) * epochs) // self.GRAD_ACCUM_STEPS
+        # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*total_steps), num_training_steps=total_steps)
 
         # L1 + MSE combined loss (element-wise, ignores padding frames)
         l1_criterion  = torch.nn.L1Loss(reduction="none")
@@ -567,18 +626,27 @@ class SpeechT5WavLM(torch.nn.Module):
                     loss_pre  = (l1_pre_raw.sum() + mse_pre_raw.sum()) / num_valid_elements
                     loss_post = (l1_post_raw.sum() + mse_post_raw.sum()) / num_valid_elements
 
-                    # Stop-token binary cross-entropy
-                    stop_targets = (~valid_mask).float()                     # 1 at padding = stop
+                    # --- THE STOP TOKEN FIX ---
+                    # Guarantee the model sees a '1' at the exact end of speech
+                    stop_targets = torch.zeros_like(valid_mask, dtype=torch.float)
+                    valid_lengths = valid_mask.sum(dim=1).long()
+                    
+                    for i, length in enumerate(valid_lengths):
+                        if length > 0:
+                            # The last valid frame and any padding after it is marked as STOP
+                            stop_targets[i, length-1:] = 1.0
+
                     loss_stop = torch.nn.functional.binary_cross_entropy_with_logits(
                         stop_logits[:, :T_tgt].squeeze(-1),
                         stop_targets,
                     )
 
-                    loss = loss_pre + loss_post + 0.5 * loss_stop
+                    # Lower stop-token pressure to prioritize spectrogram learning
+                    loss = loss_pre + loss_post + 0.1 * loss_stop
 
-                    (loss / GRAD_ACCUM_STEPS).backward()
+                    (loss / self.GRAD_ACCUM_STEPS).backward()
 
-                    if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                    if (step + 1) % self.GRAD_ACCUM_STEPS == 0:
                         # 1. Clip the main model
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         
@@ -586,7 +654,6 @@ class SpeechT5WavLM(torch.nn.Module):
                         if hasattr(self, 'wavlm_proj'):
                             torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
                         optimizer.step()
-                        scheduler.step() # <--- ADDED HERE
                         optimizer.zero_grad()
 
                     current_loss = loss.item()
@@ -662,24 +729,39 @@ class SpeechT5WavLM(torch.nn.Module):
 
     def save(self, path):
         os.makedirs(path, exist_ok=True)
+        # Save model and config
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))
         self.vocoder.save_pretrained(os.path.join(path, "vocoder"))
+        
+        # Save the custom Conv1DBridge state
         torch.save(self.wavlm_proj.state_dict(), os.path.join(path, "wavlm_proj.pth"))
+        
+        # Save speaker embeddings
         if self.target_embeddings is not None:
             np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
+            
+        # Save metadata
+        metadata = {
+            "wavlm_model_name": self.wavlm_model_name,
+            "architecture": "Conv1DBridge_Residual_V1"
+        }
+        with open(os.path.join(path, "metadata.json"), "w") as f:
+            json.dump(metadata, f)
 
     def load(self, path):
         model_path = os.path.join(path, "model")
         if os.path.exists(os.path.join(model_path, "adapter_config.json")):
+            print("Loading PEFT/Lora adapter...")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained("microsoft/speecht5_vc")
             self.model = PeftModel.from_pretrained(self.model, model_path)
         else:
+            print("Loading full model...")
             self.model = SpeechT5ForSpeechToSpeech.from_pretrained(model_path)
         
         proj_path = os.path.join(path, "wavlm_proj.pth")
         if os.path.exists(proj_path):
-            print("Loading WavLM projection layer...")
+            print("Loading custom Conv1DBridge weights...")
             self.wavlm_proj.load_state_dict(torch.load(proj_path, map_location=self.device))
 
         self.model.to(self.device)
