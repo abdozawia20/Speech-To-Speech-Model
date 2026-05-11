@@ -1,6 +1,7 @@
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
+import torch.nn as nn
 import torchaudio
 
 if not hasattr(torchaudio, "list_audio_backends"):
@@ -22,6 +23,33 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import gc
 from speechbrain.inference.speaker import EncoderClassifier
+
+
+class Conv1DBridge(nn.Module):
+    """
+    Temporally aware bridge between WavLM (50Hz) and SpeechT5.
+    Uses a sliding window (kernel_size=5) to give the attention mechanism
+    surrounding acoustic context, smoothing out the alignment matrix.
+    """
+    def __init__(self, dim=768, kernel_size=5):
+        super().__init__()
+        # Padding ensures the sequence length remains exactly the same
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
+        self.act1 = nn.GELU()
+        self.norm1 = nn.BatchNorm1d(dim)
+        self.conv2 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
+        self.act2 = nn.GELU()
+        self.norm2 = nn.BatchNorm1d(dim)
+
+    def forward(self, x):
+        # Conv1d expects shape (Batch, Channels, Sequence Length)
+        # WavLM outputs shape (Batch, Sequence Length, Channels)
+        x = x.transpose(1, 2)
+        x = self.norm1(self.act1(self.conv1(x)))
+        x = self.norm2(self.act2(self.conv2(x)))
+        # Transpose back to SpeechT5 format
+        return x.transpose(1, 2)
 
 
 class SpeechT5WavLMDataset(Dataset):
@@ -140,7 +168,7 @@ class SpeechT5WavLM(torch.nn.Module):
         self.target_embeddings = None
 
         # Trainable Adapter/Projection layer to align WavLM space with SpeechT5
-        self.wavlm_proj = torch.nn.Linear(768, 768).to(self.device)
+        self.wavlm_proj = Conv1DBridge(dim=768, kernel_size=5).to(self.device)
 
     def get_speaker_embedding(self, target_lang):
         print("Initializing X-Vector classifier for embedding extraction...")
@@ -191,33 +219,16 @@ class SpeechT5WavLM(torch.nn.Module):
             return encoder_obj.wrapped_encoder
         return encoder_obj
 
-    def _encode_wavlm_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> BaseModelOutput:
-        # Align WavLM latent space to SpeechT5 transformer space
-        hidden_states = self.wavlm_proj(hidden_states)
+    def _encode_wavlm_states(self, hidden_states, attention_mask=None):
+        # 1. Pass through the new Conv1D Bridge
+        projected_states = self.wavlm_proj(hidden_states)
 
-        # Normalize WavLM features (SpeechT5 expects normalized features here)
-        hidden_states = torch.nn.functional.layer_norm(hidden_states, [hidden_states.shape[-1]])
-
-        prenet = self.model.speecht5.encoder.prenet
-
-        # Add positional convolutional embedding
-        positional_conv_embedding = prenet.pos_conv_embed(hidden_states)
-        hidden_states = hidden_states + positional_conv_embedding
-
-        # Add positional sinusoidal embedding
-        if attention_mask is not None:
-            padding_mask = attention_mask.ne(1).long()
-        else:
-            padding_mask = torch.zeros(hidden_states.shape[:2], dtype=torch.long, device=hidden_states.device)
-
-        positional_sinusoidal_embeddings = prenet.pos_sinusoidal_embed(padding_mask)
-        hidden_states = hidden_states + positional_sinusoidal_embeddings
-
-        transformer_enc = self._get_speecht5_transformer_encoder()
-        return transformer_enc(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            return_dict=True,
+        # 2. Mock the BaseModelOutput for SpeechT5
+        from transformers.modeling_outputs import BaseModelOutput
+        return BaseModelOutput(
+            last_hidden_state=projected_states,
+            hidden_states=None,
+            attentions=None
         )
 
     def run_inference(self, audio_array, sampling_rate, speaker_embedding=None,
@@ -402,15 +413,28 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.train()
         self.wavlm_proj.train()
 
-        torch.nn.init.eye_(self.wavlm_proj.weight)
-        torch.nn.init.zeros_(self.wavlm_proj.bias)
+        # --- THE DIRAC HACK ---
+        # Initialize Conv1D kernels as Dirac delta functions (Convolutional Identity).
+        # This passes the WavLM features straight through untouched on Epoch 1,
+        # preventing the optimizer from panicking and "playing dead".
+        nn.init.dirac_(self.wavlm_proj.conv1.weight)
+        nn.init.zeros_(self.wavlm_proj.conv1.bias)
+        nn.init.dirac_(self.wavlm_proj.conv2.weight)
+        nn.init.zeros_(self.wavlm_proj.conv2.bias)
 
+        # Disable dropout during the 1-sample overfit to establish base alignment
         for module in self.model.modules():
-            if isinstance(module, torch.nn.Dropout):
+            if isinstance(module, nn.Dropout):
                 module.eval()
-        optimizer = torch.optim.AdamW(
+
+        # Ensure the Conv1D Bridge parameters are included in the optimizer
+        trainable_params = (
             list(filter(lambda p: p.requires_grad, self.model.parameters())) +
-            list(self.wavlm_proj.parameters()),
+            list(self.wavlm_proj.parameters())
+        )
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
             lr=learning_rate,
         )
 
