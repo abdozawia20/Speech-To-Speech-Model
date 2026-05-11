@@ -132,8 +132,8 @@ class SpeechT5WavLM(torch.nn.Module):
         self.vocoder.to(self.device)
 
         # CRITICAL OVERRIDE: High Resolution Setup (v6)
-        self.model.config.num_mel_bins = 128
-        self.vocoder.config.num_mel_bins = 128
+        self.model.config.num_mel_bins = 80
+        self.vocoder.config.num_mel_bins = 80
         self.vocoder.config.hop_length = 256
         self.vocoder.config.win_length = 1024
 
@@ -223,6 +223,10 @@ class SpeechT5WavLM(torch.nn.Module):
     def run_inference(self, audio_array, sampling_rate, speaker_embedding=None,
                       threshold=0.5, minlenratio=0.0, maxlenratio=2.0):
 
+        self.model.eval()
+        self.vocoder.eval()
+        self.wavlm_proj.eval()
+
         if speaker_embedding is not None:
             emb = torch.tensor(speaker_embedding).to(self.device).unsqueeze(0)
         elif self.target_embeddings is not None:
@@ -257,55 +261,49 @@ class SpeechT5WavLM(torch.nn.Module):
             encoder_out = self._encode_wavlm_states(hidden_states, attention_mask)
             encoder_states = encoder_out.last_hidden_state
 
-            config = self.model.config
-            num_mel = config.num_mel_bins
-            rf = config.reduction_factor
-            max_steps = int(maxlenratio * encoder_states.shape[1] / rf)
-            min_steps = int(minlenratio * encoder_states.shape[1] / rf)
+            # 5. THE FIX: Let Hugging Face handle the complex auto-regressive generation
+            # Note: SpeechT5's generate_speech hardcodes the CNN encoder pass. 
+            # We temporarily mock the CNN encoder to bypass it and return your WavLM states!
+            original_encoder = self.model.speecht5.encoder
+            
+            class MockEncoder(torch.nn.Module):
+                def forward(self, input_values, attention_mask, return_dict):
+                    return encoder_out
+                @property
+                def main_input_name(self):
+                    return "input_values"
+                    
+            self.model.speecht5.encoder = MockEncoder()
+            
+            # generate_speech requires an input_values tensor to determine the sequence length
+            # for the attention mask. 
+            # 1. THE BLIND MASK FIX: Use ones, not zeros! 
+            # (pad_token_id is 0, so zeros would make the attention mask blind the model).
+            dummy_input = torch.ones((1, encoder_states.shape[1]), dtype=torch.float32, device=self.device)
+            
+            # 2. THE DROPOUT RE-INJECTION
+            # Force the prenet dropout to remain ACTIVE to break the deterministic loop
+            for module in self.model.speecht5.decoder.prenet.modules():
+                if isinstance(module, torch.nn.Dropout):
+                    module.train()
 
-            output_seq = torch.zeros(1, 1, num_mel, device=self.device)
-            past_key_values = None
-            spectrogram = []
-
-            for step in range(max_steps):
-                dec_hidden = self.model.speecht5.decoder.prenet(output_seq, emb)
-                dec_out = self.model.speecht5.decoder.wrapped_decoder(
-                    hidden_states=dec_hidden[:, -1:],
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_states,
-                    encoder_attention_mask=None,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    return_dict=True,
+            try:
+                speech = self.model.generate_speech(
+                    dummy_input,
+                    speaker_embeddings=emb,
+                    threshold=threshold,
+                    minlenratio=minlenratio,
+                    maxlenratio=maxlenratio,
+                    vocoder=self.vocoder
                 )
-                last_out = dec_out.last_hidden_state.squeeze(1)
-                past_key_values = dec_out.past_key_values
-
-                spectrum = self.model.speech_decoder_postnet.feat_out(last_out)
-                spectrum = spectrum.view(1, rf, num_mel)
-                spectrogram.append(spectrum)
-
-                new_frame = spectrum[:, -1:, :]
-                output_seq = torch.cat((output_seq, new_frame), dim=1)
-
-                prob = torch.sigmoid(self.model.speech_decoder_postnet.prob_out(last_out))
-                if step >= min_steps and prob.max() > threshold:
-                    break
-
-            if not spectrogram:
-                return {'audio': {'array': np.zeros(16000, dtype=np.float32), 'sampling_rate': 16000}}
-
-            mel = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)
-            mel = mel + self.model.speech_decoder_postnet.postnet(mel)
-            
-            # --- THE FIX: Precise Official Denormalization ---
-            vocoder_input = (mel * 2.0) - 5.0
-            
-            speech = self.vocoder(vocoder_input).squeeze()
+            finally:
+                self.model.speecht5.encoder = original_encoder
+                
+            speech = speech.squeeze()
 
         return {'audio': {'array': speech.cpu().numpy(), 'sampling_rate': 16000}}
 
-    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size):
+    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5):
         """
         Fine-tune the hybrid WavLM → SpeechT5 pipeline.
 
@@ -334,7 +332,7 @@ class SpeechT5WavLM(torch.nn.Module):
         from transformers.models.speecht5.modeling_speecht5 import shift_spectrograms_right
 
         print("Starting WavLM+SpeechT5 fine-tuning (Hybrid Architecture).")
-        GRAD_ACCUM_STEPS = 4
+        GRAD_ACCUM_STEPS = 1
 
         # ------------------------------------------------------------------
         # 1. Load the unified paired dataset
@@ -404,6 +402,12 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.train()
         self.wavlm_proj.train()
 
+        torch.nn.init.eye_(self.wavlm_proj.weight)
+        torch.nn.init.zeros_(self.wavlm_proj.bias)
+
+        for module in self.model.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
         optimizer = torch.optim.AdamW(
             list(filter(lambda p: p.requires_grad, self.model.parameters())) +
             list(self.wavlm_proj.parameters()),
@@ -413,8 +417,8 @@ class SpeechT5WavLM(torch.nn.Module):
         # Calculate total optimization steps (accounting for gradient accumulation)
         total_steps = len(train_loader) * epochs // GRAD_ACCUM_STEPS
 
-        # Set warmup to 10% of total training steps
-        warmup_steps = int(total_steps * 0.1)
+        # Set warmup to 0 for brute-force overfit testing
+        warmup_steps = 0
 
         # Initialize the new scheduler
         scheduler = get_linear_schedule_with_warmup(
@@ -491,17 +495,12 @@ class SpeechT5WavLM(torch.nn.Module):
                     pred_before = outputs_before_postnet[:, :T_tgt, :]      # (B, T, 80)
                     pred_after  = outputs_after_postnet[:, :T_tgt, :]       # (B, T, 80)
 
-                    # Mask out padded target frames
-                    pred_before_m = pred_before * valid_mask_expanded
-                    pred_after_m  = pred_after  * valid_mask_expanded
-                    labels_m      = labels.clone()
-                    labels_m[labels == -100.0] = 0.0                        # zero-out padding
-
-                    # 1. Calculate un-reduced, element-wise losses
-                    l1_pre_raw  = l1_criterion(pred_before_m, labels_m)
-                    mse_pre_raw = mse_criterion(pred_before_m, labels_m)
-                    l1_post_raw = l1_criterion(pred_after_m,  labels_m)
-                    mse_post_raw= mse_criterion(pred_after_m,  labels_m)
+                    # 1. Calculate un-reduced, element-wise losses (masking out padding)
+                    # We compute the raw loss first, then multiply by the valid_mask_expanded (0 for padding)
+                    l1_pre_raw  = l1_criterion(pred_before, labels) * valid_mask_expanded
+                    mse_pre_raw = mse_criterion(pred_before, labels) * valid_mask_expanded
+                    l1_post_raw = l1_criterion(pred_after, labels) * valid_mask_expanded
+                    mse_post_raw= mse_criterion(pred_after, labels) * valid_mask_expanded
 
                     # 2. Count exact number of valid scalar predictions
                     # valid_mask_expanded is (B, T, 1). Summing it gives total valid timeframes.
@@ -527,7 +526,12 @@ class SpeechT5WavLM(torch.nn.Module):
                     (loss / GRAD_ACCUM_STEPS).backward()
 
                     if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                        # 1. Clip the main model
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        
+                        # 2. CRITICAL: Clip your custom projection layer too!
+                        if hasattr(self, 'wavlm_proj'):
+                            torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
                         optimizer.step()
                         scheduler.step() # <--- ADDED HERE
                         optimizer.zero_grad()
@@ -541,12 +545,10 @@ class SpeechT5WavLM(torch.nn.Module):
 
                     # Free intermediate tensors explicitly each step
                     del encoder_out, outputs, pred_before, pred_after, loss
-                    if step % 50 == 0:
-                        torch.cuda.empty_cache()
 
                 avg_loss = epoch_loss / max(num_batches, 1)
                 print(f"Epoch {epoch+1}/{epochs}  Avg Loss: {avg_loss:.4f}")
-                if (epoch + 1) % 5 == 0:
+                if (epoch + 1) % saving_checkpoint == 0:
                     self.save(f"checkpoint_epoch_{epoch+1}")
 
         except KeyboardInterrupt:
@@ -635,7 +637,3 @@ class SpeechT5WavLM(torch.nn.Module):
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
             self.target_embeddings = torch.tensor(np.load(emb_path))
-ath = os.path.join(path, "speaker_embedding.npy")
-        if os.path.exists(emb_path):
-            self.target_embeddings = torch.tensor(np.load(emb_path))
-))
