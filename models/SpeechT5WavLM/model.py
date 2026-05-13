@@ -22,6 +22,7 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import gc
+from functools import partial
 from speechbrain.inference.speaker import EncoderClassifier
 
 
@@ -88,18 +89,16 @@ class SpeechT5WavLMDataset(Dataset):
     This avoids maintaining two separate language directories and ensures that
     every (source, target) pair is always correctly aligned.
     """
-    def __init__(self, paired_ds, processor, speaker_embeddings, coarse_mode=False):
+    def __init__(self, paired_ds, processor, speaker_embeddings):
         """
         Args:
             paired_ds         : HuggingFace Dataset with columns ['input_values', 'labels']
             processor         : SpeechT5Processor (kept for potential fallback / tokenisation)
             speaker_embeddings: 1-D tensor of shape (512,) — fallback target-language x-vector
-            coarse_mode       : bool, whether to apply temporal average pooling (coarse-to-fine training)
         """
         self.paired_ds = paired_ds
         self.processor = processor
         self.speaker_embeddings = speaker_embeddings
-        self.coarse_mode = coarse_mode
 
     def __len__(self):
         return len(self.paired_ds)
@@ -135,23 +134,6 @@ class SpeechT5WavLMDataset(Dataset):
         if target_features.shape[0] == 80 and target_features.shape[1] != 80:
             target_features = target_features.transpose(0, 1)
 
-        if target_features.shape[0] % 2 != 0:
-            target_features = target_features[:-1, :]
-
-        # ------------------------------------------------------------------
-        # COARSE MODE: Temporal Average Pooling (Downsample by 2)
-        # ------------------------------------------------------------------
-        if self.coarse_mode:
-            # For WavLM (Seq, 768) -> pooling along Seq dimension
-            # AvgPool1d expects (Batch, Channels, Seq)
-            source_features = source_features.transpose(0, 1).unsqueeze(0) # (1, 768, Seq)
-            source_features = torch.nn.functional.avg_pool1d(source_features, kernel_size=2, stride=2)
-            source_features = source_features.squeeze(0).transpose(0, 1) # (Seq/2, 768)
-            
-        # Ensure T is a multiple of 2 (reduction_factor)
-        if target_features.shape[0] % 2 != 0:
-            target_features = target_features[:-1, :]
-
         # ------------------------------------------------------------------
         # SPEAKER: 512-dim x-vector
         # ------------------------------------------------------------------
@@ -167,9 +149,15 @@ class SpeechT5WavLMDataset(Dataset):
         }
 
 
-def wavlm_speecht5_collate_fn(batch):
+def wavlm_speecht5_collate_fn(batch, reduction_factor=2):
     input_values = [item["input_values"] for item in batch]
-    labels = [item["labels"] for item in batch]
+    # Trim labels to be divisible by reduction_factor
+    labels = [
+        item["labels"][:item["labels"].shape[0] - item["labels"].shape[0] % reduction_factor]
+        if item["labels"].shape[0] % reduction_factor != 0
+        else item["labels"]
+        for item in batch
+    ]
     speaker_embeddings = [item["speaker_embeddings"] for item in batch]
 
     input_values_padded = torch.nn.utils.rnn.pad_sequence(input_values, batch_first=True)
@@ -412,8 +400,8 @@ class SpeechT5WavLM(torch.nn.Module):
             return speech.cpu().numpy(), spectrogram.squeeze().cpu().numpy()
         return speech.cpu().numpy()
 
-    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, coarse_mode, 
-                     optimizer, scaler, scheduler, global_step=0,
+    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, 
+                     optimizer, scaler, scheduler, reduction_factor=2, global_step=0,
                      start_epoch=0, total_epochs_label=None, step_callback=None):
         """
         Internal method to handle a single training phase (Coarse or Fine).
@@ -421,8 +409,11 @@ class SpeechT5WavLM(torch.nn.Module):
         if epochs <= 0:
             return global_step
 
-        phase_name = "COARSE" if coarse_mode else "FINE"
+        # Apply reduction factor to model config
+        self.model.config.reduction_factor = reduction_factor
+        phase_name = "COARSE" if reduction_factor > 2 else "FINE"
         print(f"\n>>> Starting {phase_name} Training Phase ({epochs} epochs)")
+        print(f"[{phase_name}] reduction_factor set to {self.model.config.reduction_factor}")
 
         # 0. Ensure memory is clean and checkpointing is off
         torch.cuda.empty_cache()
@@ -434,15 +425,16 @@ class SpeechT5WavLM(torch.nn.Module):
         train_dataset = SpeechT5WavLMDataset(
             paired_ds,
             self.processor,
-            self.target_embeddings,
-            coarse_mode=coarse_mode
+            self.target_embeddings
         )
+
+        collate_fn = partial(wavlm_speecht5_collate_fn, reduction_factor=reduction_factor)
 
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            collate_fn=wavlm_speecht5_collate_fn,
+            collate_fn=collate_fn,
             num_workers=2,
             pin_memory=True,
         )
@@ -464,6 +456,9 @@ class SpeechT5WavLM(torch.nn.Module):
                 pbar = tqdm(train_loader, desc=f"[{phase_name}] Epoch {actual_epoch}/{display_total}")
 
                 for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
+                    if step == 0 and epoch_idx == 0:
+                         assert labels.shape[1] % reduction_factor == 0, f"Labels length {labels.shape[1]} not divisible by {reduction_factor}"
+                    
                     global_step += 1
                     input_values       = input_values.to(self.device)
                     attention_mask     = attention_mask.to(self.device).long()
@@ -623,7 +618,7 @@ class SpeechT5WavLM(torch.nn.Module):
             if coarse_epochs > 0:
                 global_step = self._train_phase(
                     paired_ds, coarse_epochs, learning_rate, batch_size, saving_checkpoint, 
-                    coarse_mode=True, optimizer=optimizer, scaler=scaler, scheduler=scheduler, global_step=global_step,
+                    optimizer=optimizer, scaler=scaler, scheduler=scheduler, reduction_factor=4, global_step=global_step,
                     start_epoch=0, total_epochs_label=total_epochs, step_callback=step_callback
                 )
                 print("\n>>> Phase A (Coarse) complete. Transitioning to Phase B (Fine)...")
@@ -631,7 +626,7 @@ class SpeechT5WavLM(torch.nn.Module):
             # PHASE B: Fine-grained Training
             self._train_phase(
                 paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, 
-                coarse_mode=False, optimizer=optimizer, scaler=scaler, scheduler=scheduler, global_step=global_step,
+                optimizer=optimizer, scaler=scaler, scheduler=scheduler, reduction_factor=2, global_step=global_step,
                 start_epoch=coarse_epochs, total_epochs_label=total_epochs, step_callback=step_callback
             )
 
