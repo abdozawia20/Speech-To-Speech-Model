@@ -506,20 +506,24 @@ class SpeechT5WavLM(torch.nn.Module):
             return speech.cpu().numpy(), spectrogram.squeeze().cpu().numpy()
         return speech.cpu().numpy()
 
-    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, 
-                     optimizer, scaler, scheduler, reduction_factor=2, global_step=0,
+    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint,
+                     optimizer, scaler, scheduler, coarse_mode=False, global_step=0,
                      start_epoch=0, total_epochs_label=None, step_callback=None):
         """
         Internal method to handle a single training phase (Coarse or Fine).
+
+        Coarse supervision is achieved by striding mel targets 2× along the
+        time axis (labels[:, ::2, :]) — model.config.reduction_factor is never
+        changed from its initialised value of 2, because the decoder prenet's
+        Linear weight is frozen to shape (256, 80*2=160) at load time.
         """
         if epochs <= 0:
             return global_step
 
-        # Apply reduction factor to model config
-        self.model.config.reduction_factor = reduction_factor
-        phase_name = "COARSE" if reduction_factor > 2 else "FINE"
+        phase_name = "COARSE" if coarse_mode else "FINE"
         print(f"\n>>> Starting {phase_name} Training Phase ({epochs} epochs)")
-        print(f"[{phase_name}] reduction_factor set to {self.model.config.reduction_factor}")
+        if coarse_mode:
+            print("[COARSE] Temporal striding active: mel targets downsampled 2x. config.reduction_factor stays at 2.")
 
         # 0. Ensure memory is clean and checkpointing is off
         torch.cuda.empty_cache()
@@ -534,7 +538,8 @@ class SpeechT5WavLM(torch.nn.Module):
             self.target_embeddings
         )
 
-        collate_fn = partial(wavlm_speecht5_collate_fn, reduction_factor=reduction_factor)
+        # Collate always uses reduction_factor=2 — the model config is never changed.
+        collate_fn = partial(wavlm_speecht5_collate_fn, reduction_factor=2)
 
         train_loader = DataLoader(
             train_dataset,
@@ -563,7 +568,7 @@ class SpeechT5WavLM(torch.nn.Module):
 
                 for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
                     if step == 0 and epoch_idx == 0:
-                        assert labels.shape[1] % reduction_factor == 0, f"Labels length {labels.shape[1]} not divisible by {reduction_factor}"
+                        assert labels.shape[1] % 2 == 0, f"Labels length {labels.shape[1]} not divisible by 2"
 
                     global_step += 1
                     input_values       = input_values.to(self.device)
@@ -756,17 +761,19 @@ class SpeechT5WavLM(torch.nn.Module):
             # PHASE A: Coarse Training
             if coarse_epochs > 0:
                 global_step = self._train_phase(
-                    paired_ds, coarse_epochs, learning_rate, batch_size, saving_checkpoint, 
-                    optimizer=optimizer, scaler=scaler, scheduler=scheduler, reduction_factor=4, global_step=global_step,
-                    start_epoch=0, total_epochs_label=total_epochs, step_callback=step_callback
+                    paired_ds, coarse_epochs, learning_rate, batch_size, saving_checkpoint,
+                    optimizer=optimizer, scaler=scaler, scheduler=scheduler, coarse_mode=True,
+                    global_step=global_step, start_epoch=0, total_epochs_label=total_epochs,
+                    step_callback=step_callback
                 )
                 print("\n>>> Phase A (Coarse) complete. Transitioning to Phase B (Fine)...")
-            
+
             # PHASE B: Fine-grained Training
             self._train_phase(
-                paired_ds, epochs, learning_rate, batch_size, saving_checkpoint, 
-                optimizer=optimizer, scaler=scaler, scheduler=scheduler, reduction_factor=2, global_step=global_step,
-                start_epoch=coarse_epochs, total_epochs_label=total_epochs, step_callback=step_callback
+                paired_ds, epochs, learning_rate, batch_size, saving_checkpoint,
+                optimizer=optimizer, scaler=scaler, scheduler=scheduler, coarse_mode=False,
+                global_step=global_step, start_epoch=coarse_epochs, total_epochs_label=total_epochs,
+                step_callback=step_callback
             )
 
             print("\nTraining completed successfully.")
