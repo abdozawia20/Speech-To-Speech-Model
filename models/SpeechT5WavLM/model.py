@@ -170,7 +170,7 @@ class SpeechT5WavLMDataset(Dataset):
 
         Checks performed per row:
           - Source (input_values) is reshapeable to (Seq, 768) with no remainder.
-          - Target (labels) has 80 mel bins.
+          - Target (labels) has 80 mel bins and length divisible by reduction_factor.
           - Neither source nor target contain NaN or Inf values.
         """
         import random
@@ -197,6 +197,13 @@ class SpeechT5WavLMDataset(Dataset):
             if tgt_2d.ndim == 2 and tgt_2d.shape[1] != 80:
                 raise ValueError(
                     f"Row {idx}: target shape {tgt_2d.shape} — expected 80 mel bins."
+                )
+
+            # Target time-axis must be divisible by reduction_factor
+            T = tgt_2d.shape[0] if tgt_2d.ndim == 2 else tgt.shape[0]
+            if T % reduction_factor != 0:
+                raise ValueError(
+                    f"Row {idx}: target length {T} is not divisible by reduction_factor={reduction_factor}."
                 )
 
             # No NaN or Inf in source or target
@@ -556,13 +563,21 @@ class SpeechT5WavLM(torch.nn.Module):
 
                 for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
                     if step == 0 and epoch_idx == 0:
-                         assert labels.shape[1] % reduction_factor == 0, f"Labels length {labels.shape[1]} not divisible by {reduction_factor}"
-                    
+                        assert labels.shape[1] % reduction_factor == 0, f"Labels length {labels.shape[1]} not divisible by {reduction_factor}"
+
                     global_step += 1
                     input_values       = input_values.to(self.device)
                     attention_mask     = attention_mask.to(self.device).long()
                     labels             = labels.to(self.device)
                     speaker_embeddings = speaker_embeddings.to(self.device)
+
+                    # Coarse-phase temporal downsampling: rather than setting
+                    # reduction_factor=4 in the model config (which breaks the
+                    # decoder prenet's fixed Linear(160, ...) weight shape),
+                    # we stride the mel targets 2x along the time axis to give
+                    # a coarser supervision signal while keeping config.reduction_factor=2.
+                    if phase_name == "COARSE":
+                        labels = labels[:, ::2, :]  # (B, T//2, 80)
 
                     # Mixed Precision Forward Pass
                     with torch.amp.autocast('cuda'):
@@ -607,17 +622,19 @@ class SpeechT5WavLM(torch.nn.Module):
                     if (step + 1) % self.GRAD_ACCUM_STEPS == 0:
                         # Unscale gradients for clipping
                         scaler.unscale_(optimizer)
-                        
-                        if global_step == 1:
+
+                        # Grad norm diagnostic — fires at step 1 and every ~2 epochs thereafter
+                        steps_per_epoch_approx = max(1, len(train_loader))
+                        if global_step == 1 or global_step % (steps_per_epoch_approx * 2) == 0:
                             for name, param in [("wavlm_proj", self.wavlm_proj), ("encoder_spk_proj", self.encoder_spk_proj)]:
                                 grad_norm = sum(
                                     p.grad.norm().item() ** 2 for p in param.parameters() if p.grad is not None
                                 ) ** 0.5
-                                print(f"[GradCheck] {name} grad norm at step 1: {grad_norm:.6f}")
+                                print(f"[GradCheck] {name} grad norm at step {global_step}: {grad_norm:.6f}")
 
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        if hasattr(self, "wavlm_proj"):
-                            torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.encoder_spk_proj.parameters(), max_norm=1.0)
                         
                         # Scaled Optimizer Step
                         scaler.step(optimizer)
@@ -817,14 +834,15 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.save_pretrained(os.path.join(path, "model"))
         self.processor.save_pretrained(os.path.join(path, "processor"))
         self.vocoder.save_pretrained(os.path.join(path, "vocoder"))
-        
-        # Save the custom Conv1DBridge state
-        torch.save(self.wavlm_proj.state_dict(), os.path.join(path, "wavlm_proj.pth"))
-        
+
+        # Save custom projection weights
+        torch.save(self.wavlm_proj.state_dict(),        os.path.join(path, "wavlm_proj.pth"))
+        torch.save(self.encoder_spk_proj.state_dict(),  os.path.join(path, "encoder_spk_proj.pth"))
+
         # Save speaker embeddings
         if self.target_embeddings is not None:
             np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
-            
+
         # Save metadata
         metadata = {
             "wavlm_model_name": self.wavlm_model_name,
@@ -848,11 +866,18 @@ class SpeechT5WavLM(torch.nn.Module):
             print("Loading custom Conv1DBridge weights...")
             self.wavlm_proj.load_state_dict(torch.load(proj_path, map_location=self.device))
 
+        spk_proj_path = os.path.join(path, "encoder_spk_proj.pth")
+        if os.path.exists(spk_proj_path):
+            print("Loading encoder_spk_proj weights...")
+            self.encoder_spk_proj.load_state_dict(torch.load(spk_proj_path, map_location=self.device))
+
         self.model.to(self.device)
         self.wavlm_proj.to(self.device)
+        self.encoder_spk_proj.to(self.device)
         self.model.eval()
         self.wavlm_proj.eval()
-        
+        self.encoder_spk_proj.eval()
+
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
             self.target_embeddings = torch.tensor(np.load(emb_path))
