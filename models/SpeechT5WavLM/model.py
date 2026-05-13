@@ -464,6 +464,7 @@ class SpeechT5WavLM(torch.nn.Module):
                 pbar = tqdm(train_loader, desc=f"[{phase_name}] Epoch {actual_epoch}/{display_total}")
 
                 for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
+                    global_step += 1
                     input_values       = input_values.to(self.device)
                     attention_mask     = attention_mask.to(self.device).long()
                     labels             = labels.to(self.device)
@@ -495,6 +496,14 @@ class SpeechT5WavLM(torch.nn.Module):
                     if (step + 1) % self.GRAD_ACCUM_STEPS == 0:
                         # Unscale gradients for clipping
                         scaler.unscale_(optimizer)
+                        
+                        if global_step == 1:
+                            for name, param in [("wavlm_proj", self.wavlm_proj), ("encoder_spk_proj", self.encoder_spk_proj)]:
+                                grad_norm = sum(
+                                    p.grad.norm().item() ** 2 for p in param.parameters() if p.grad is not None
+                                ) ** 0.5
+                                print(f"[GradCheck] {name} grad norm at step 1: {grad_norm:.6f}")
+
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         if hasattr(self, "wavlm_proj"):
                             torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
@@ -509,7 +518,6 @@ class SpeechT5WavLM(torch.nn.Module):
                     num_batches += 1
                     pbar.set_postfix({"loss": f"{loss.item():.4f}"})
                     
-                    global_step += 1
                     if step_callback is not None:
                         # Ensure we don't hold references to GPU tensors in the callback
                         step_callback(
@@ -588,7 +596,8 @@ class SpeechT5WavLM(torch.nn.Module):
         # 5. Setup Optimizer and Scheduler (Hoisted to persist across phases)
         trainable_params = (
             list(filter(lambda p: p.requires_grad, self.model.parameters())) +
-            list(self.wavlm_proj.parameters())
+            list(self.wavlm_proj.parameters()) +
+            list(self.encoder_spk_proj.parameters())
         )
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
         scaler = torch.cuda.amp.GradScaler()
