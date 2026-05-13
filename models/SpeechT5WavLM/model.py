@@ -7,6 +7,7 @@ import torchaudio
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 import numpy as np
+from contextlib import contextmanager
 from transformers import get_linear_schedule_with_warmup
 from transformers import (
     SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
@@ -62,14 +63,27 @@ class Conv1DBridge(nn.Module):
 class MockEncoder(torch.nn.Module):
     """
     Bypasses the SpeechT5 encoder by returning pre-computed hidden states.
-    This allows us to use WavLM + Bridge as the encoder while still 
+    This allows us to use WavLM + Bridge as the encoder while still
     leveraging the auto-regressive generate_speech method.
+
+    Set debug=True to receive a RuntimeWarning if forward() is called more
+    than once during a single generation pass (indicates multi-pass behaviour).
     """
-    def __init__(self, encoder_out):
+    def __init__(self, encoder_out, debug=False):
         super().__init__()
         self.encoder_out = encoder_out
+        self.debug = debug
+        self._call_count = 0
 
     def forward(self, input_values=None, attention_mask=None, return_dict=True, **kwargs):
+        self._call_count += 1
+        if self.debug and self._call_count > 1:
+            import warnings
+            warnings.warn(
+                f"MockEncoder called {self._call_count} times — generation may be multi-pass.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return self.encoder_out
 
     @property
@@ -148,6 +162,51 @@ class SpeechT5WavLMDataset(Dataset):
             "speaker_embeddings": spk_emb,
         }
 
+    @staticmethod
+    def validate_dataset(paired_ds, num_samples=50, reduction_factor=2):
+        """
+        Spot-check up to `num_samples` rows from the dataset for shape correctness.
+        Raises ValueError on the first malformed row found.
+
+        Checks performed per row:
+          - Source (input_values) is reshapeable to (Seq, 768) with no remainder.
+          - Target (labels) has 80 mel bins.
+          - Neither source nor target contain NaN or Inf values.
+        """
+        import random
+        indices = random.sample(range(len(paired_ds)), min(num_samples, len(paired_ds)))
+
+        for idx in indices:
+            row = paired_ds[int(idx)]
+
+            src = np.array(row["input_values"], dtype=np.float32)
+            tgt = np.array(row["labels"],       dtype=np.float32)
+
+            # Source must be reshapeable to (Seq, 768)
+            if src.ndim == 1 and src.size % 768 != 0:
+                raise ValueError(
+                    f"Row {idx}: source size {src.size} is not divisible by 768."
+                )
+            if src.ndim == 2 and src.shape[1] != 768:
+                raise ValueError(
+                    f"Row {idx}: source shape {src.shape} — expected dim 1 == 768."
+                )
+
+            # Target must have 80 mel bins
+            tgt_2d = tgt.reshape(-1, 80) if tgt.ndim == 1 else tgt
+            if tgt_2d.ndim == 2 and tgt_2d.shape[1] != 80:
+                raise ValueError(
+                    f"Row {idx}: target shape {tgt_2d.shape} — expected 80 mel bins."
+                )
+
+            # No NaN or Inf in source or target
+            if not np.isfinite(src).all():
+                raise ValueError(f"Row {idx}: source contains NaN or Inf.")
+            if not np.isfinite(tgt).all():
+                raise ValueError(f"Row {idx}: target contains NaN or Inf.")
+
+        print(f"[DatasetValidation] {len(indices)} rows checked — all OK.")
+
 
 def wavlm_speecht5_collate_fn(batch, reduction_factor=2):
     input_values = [item["input_values"] for item in batch]
@@ -201,6 +260,48 @@ class SpeechT5WavLM(torch.nn.Module):
         
         # Speaker projection for injection into the encoder pre-net (Paper v2)
         self.encoder_spk_proj = nn.Linear(512, 768).to(self.device)
+
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
+
+    def _log_trainable_params(self):
+        """Print a trainable-parameter audit across all major sub-modules."""
+        sections = {
+            "SpeechT5 encoder prenet":      self.model.speecht5.encoder.prenet
+                if hasattr(self.model.speecht5.encoder, "prenet")
+                else self.model.speecht5.encoder,
+            "SpeechT5 transformer encoder": self.model.speecht5.encoder.wrapped_encoder
+                if hasattr(self.model.speecht5.encoder, "wrapped_encoder")
+                else self.model.speecht5.encoder,
+            "SpeechT5 decoder":             self.model.speecht5.decoder,
+            "SpeechT5 speech postnet":      self.model.speech_decoder_postnet,
+            "Conv1DBridge (wavlm_proj)":     self.wavlm_proj,
+            "encoder_spk_proj":             self.encoder_spk_proj,
+        }
+        print("\n--- Trainable Parameter Audit ---")
+        for name, module in sections.items():
+            total   = sum(p.numel() for p in module.parameters())
+            trained = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            print(f"  {name:<42} {trained:>10,} / {total:>10,} params trainable")
+        print("---------------------------------\n")
+
+    @contextmanager
+    def _mock_encoder_ctx(self, encoder_out, debug=False):
+        """
+        Context manager that temporarily replaces the SpeechT5 encoder with a
+        MockEncoder wrapping pre-computed hidden states, then unconditionally
+        restores the original encoder on exit (even under KeyboardInterrupt).
+
+        Pass debug=True to receive a RuntimeWarning if the encoder is called
+        more than once during generation (indicates unexpected multi-pass use).
+        """
+        original_encoder = self.model.speecht5.encoder
+        self.model.speecht5.encoder = MockEncoder(encoder_out, debug=debug)
+        try:
+            yield
+        finally:
+            self.model.speecht5.encoder = original_encoder
 
     def get_speaker_embedding(self, target_lang):
         print("Initializing X-Vector classifier for embedding extraction...")
@@ -361,15 +462,15 @@ class SpeechT5WavLM(torch.nn.Module):
 
         with torch.no_grad():
             encoder_out = self._encode_wavlm_states(wavlm_hidden_states, speaker_embeddings, attention_mask)
-            
-            # Setup MockEncoder to bypass native SpeechT5 encoder during generation
-            original_encoder = self.model.speecht5.encoder
-            self.model.speecht5.encoder = MockEncoder(encoder_out)
-            
+
             # Dummy input matching the encoder sequence length
-            dummy_input = torch.ones((1, encoder_out.last_hidden_state.shape[1]), dtype=torch.float32, device=self.device)
-            
-            try:
+            dummy_input = torch.ones(
+                (1, encoder_out.last_hidden_state.shape[1]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+            with self._mock_encoder_ctx(encoder_out):
                 if return_spectrogram:
                     spectrogram = self.model.generate_speech(
                         dummy_input,
@@ -378,7 +479,7 @@ class SpeechT5WavLM(torch.nn.Module):
                         threshold=threshold,
                         minlenratio=minlenratio,
                         maxlenratio=maxlenratio,
-                        vocoder=None
+                        vocoder=None,
                     )
                     speech = self.vocoder(spectrogram)
                 else:
@@ -389,11 +490,9 @@ class SpeechT5WavLM(torch.nn.Module):
                         threshold=threshold,
                         minlenratio=minlenratio,
                         maxlenratio=maxlenratio,
-                        vocoder=self.vocoder
+                        vocoder=self.vocoder,
                     )
-            finally:
-                self.model.speecht5.encoder = original_encoder
-                
+
             speech = speech.squeeze()
 
         if return_spectrogram:
@@ -483,7 +582,24 @@ class SpeechT5WavLM(torch.nn.Module):
                         )
                         
                         loss = outputs.loss
-                        mel_after = outputs.spectrogram # Extract the predicted mel for your visualization callback
+                        mel_after = outputs.spectrogram  # Extract the predicted mel for visualization callback
+
+                    # Fallback: SpeechT5ForSpeechToSpeech may return None for loss
+                    # (e.g. with non-default reduction_factor). Compute L1 mel reconstruction loss manually.
+                    if loss is None:
+                        if mel_after is not None:
+                            T = min(mel_after.shape[1], labels.shape[1])
+                            loss = torch.nn.functional.l1_loss(mel_after[:, :T, :], labels[:, :T, :])
+                        else:
+                            print(f"[Warning] Both outputs.loss and outputs.spectrogram are None at step {global_step}. Skipping batch.")
+                            optimizer.zero_grad()
+                            continue
+
+                    # NaN/Inf loss guard — skip corrupted batches rather than crash
+                    if not torch.isfinite(loss):
+                        print(f"[Warning] Non-finite loss at step {global_step}: {loss.item()}. Skipping batch.")
+                        optimizer.zero_grad()
+                        continue
 
                     # Scaled Backward Pass
                     scaler.scale(loss / self.GRAD_ACCUM_STEPS).backward()
@@ -575,9 +691,12 @@ class SpeechT5WavLM(torch.nn.Module):
         if self.target_embeddings is None:
             self.get_speaker_embedding(target_lang)
 
-        # 3. Freeze the SpeechT5 CNN feature encoder
-        print("Freezing SpeechT5 CNN feature encoder.")
-        self.model.freeze_feature_encoder()
+        # 3. Freeze the encoder prenet (bypassed by WavLM injection anyway) and
+        #    log the full trainable-parameter audit so the split is explicit.
+        print("Freezing SpeechT5 encoder prenet (bypassed by WavLM injection).")
+        for p in self.model.speecht5.encoder.prenet.parameters():
+            p.requires_grad_(False)
+        self._log_trainable_params()
         
         # 4. Initialize Projection (Residual Bypass Hack)
         # Ensure the bridge starts close to an identity mapping
@@ -595,7 +714,7 @@ class SpeechT5WavLM(torch.nn.Module):
             list(self.encoder_spk_proj.parameters())
         )
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler('cuda')  # Updated from deprecated torch.cuda.amp.GradScaler
 
         # Calculate total steps for Inverse Square Root Decay scheduler
         steps_per_epoch = (len(paired_ds) + batch_size - 1) // batch_size
@@ -611,6 +730,9 @@ class SpeechT5WavLM(torch.nn.Module):
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
+        # 6. Validate dataset shapes before any training begins
+        SpeechT5WavLMDataset.validate_dataset(paired_ds, num_samples=100, reduction_factor=2)
+
         global_step = 0
         
         try:
