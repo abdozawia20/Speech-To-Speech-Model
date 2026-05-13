@@ -8,15 +8,13 @@ if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 import numpy as np
 from contextlib import contextmanager
-from transformers import get_linear_schedule_with_warmup
 from transformers import (
     SpeechT5ForSpeechToSpeech, SpeechT5Processor, SpeechT5HifiGan,
-    WavLMModel, Wav2Vec2Processor, Wav2Vec2FeatureExtractor
+    WavLMModel, Wav2Vec2FeatureExtractor
 )
 from transformers.modeling_outputs import BaseModelOutput
 from datasets import load_from_disk, load_dataset
 import dataset_loader
-import librosa
 import sys
 import json
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
@@ -353,11 +351,6 @@ class SpeechT5WavLM(torch.nn.Module):
         torch.cuda.empty_cache()
         gc.collect()
 
-    def _get_speecht5_transformer_encoder(self):
-        encoder_obj = self.model.speecht5.encoder
-        if hasattr(encoder_obj, "wrapped_encoder"):
-            return encoder_obj.wrapped_encoder
-        return encoder_obj
 
     def _encode_wavlm_states(self, hidden_states, speaker_embeddings, attention_mask=None):
         # 1. Pass through the Conv1D Bridge
@@ -397,6 +390,7 @@ class SpeechT5WavLM(torch.nn.Module):
         """
         self.model.eval()
         self.wavlm_proj.eval()
+        self.encoder_spk_proj.eval()
 
         # 1. Prepare speaker embedding
         if speaker_embedding is not None:
@@ -454,6 +448,7 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.eval()
         self.vocoder.eval()
         self.wavlm_proj.eval()
+        self.encoder_spk_proj.eval()
 
         # Handle shapes
         if wavlm_hidden_states.ndim == 2:
@@ -581,8 +576,14 @@ class SpeechT5WavLM(torch.nn.Module):
                     # decoder prenet's fixed Linear(160, ...) weight shape),
                     # we stride the mel targets 2x along the time axis to give
                     # a coarser supervision signal while keeping config.reduction_factor=2.
+                    # The post-stride length must also be even so that
+                    # shift_spectrograms_right (which uses reduction_factor=2) never
+                    # receives an odd-length sequence and produces a 240-dim instead
+                    # of 160-dim input to the prenet Linear.
                     if phase_name == "COARSE":
-                        labels = labels[:, ::2, :]  # (B, T//2, 80)
+                        labels = labels[:, ::2, :]        # (B, T//2, 80)
+                        if labels.shape[1] % 2 != 0:     # ensure even length
+                            labels = labels[:, :-1, :]   # drop one frame if odd
 
                     # Mixed Precision Forward Pass
                     with torch.amp.autocast('cuda'):
