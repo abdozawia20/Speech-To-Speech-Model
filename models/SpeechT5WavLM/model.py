@@ -364,10 +364,7 @@ class SpeechT5WavLM(torch.nn.Module):
         # projected_states shape: (Batch, Seq, Dim)
         projected_states = prenet.pos_conv_embed(projected_states)
         
-        # 5. Apply LayerNorm
-        projected_states = transformer_enc.layer_norm(projected_states)
-        
-        # 6. Pass through the Transformer stack
+        # 5. Pass through the Transformer stack
         encoder_outputs = transformer_enc(
             hidden_states=projected_states,
             attention_mask=attention_mask,
@@ -535,8 +532,8 @@ class SpeechT5WavLM(torch.nn.Module):
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True,
+            num_workers=0,       # 0 = main process only; avoids pinned-memory worker leak
+            pin_memory=False,    # pin_memory with workers accumulates across epochs
         )
 
         # 2. Training state
@@ -579,6 +576,11 @@ class SpeechT5WavLM(torch.nn.Module):
                         if labels.shape[1] % 2 != 0:     # ensure even length
                             labels = labels[:, :-1, :]   # drop one frame if odd
 
+                    encoder_out = None
+                    outputs     = None
+                    loss        = None
+                    mel_after   = None
+
                     # Mixed Precision Forward Pass
                     with torch.amp.autocast('cuda'):
                         # 1. Encode WavLM states
@@ -608,13 +610,26 @@ class SpeechT5WavLM(torch.nn.Module):
                         else:
                             print(f"[Warning] Both outputs.loss and outputs.spectrogram are None at step {global_step}. Skipping batch.")
                             optimizer.zero_grad()
+                            del encoder_out, outputs, input_values, attention_mask, labels, speaker_embeddings
+                            torch.cuda.empty_cache()
                             continue
 
                     # NaN/Inf loss guard — skip corrupted batches rather than crash
                     if not torch.isfinite(loss):
                         print(f"[Warning] Non-finite loss at step {global_step}: {loss.item()}. Skipping batch.")
                         optimizer.zero_grad()
+                        del encoder_out, outputs, loss, mel_after, input_values, attention_mask, labels, speaker_embeddings
+                        torch.cuda.empty_cache()
                         continue
+
+                    # Step-1 sanity: print value ranges to catch data-scale mismatches early.
+                    # A loss of ~26 when labels sit in [-5, 0] means scale corruption.
+                    if global_step == 1:
+                        valid_labels = labels[labels != -100]
+                        print(f"[Sanity] labels  min={valid_labels.min():.3f}  max={valid_labels.max():.3f}  mean={valid_labels.mean():.3f}")
+                        if mel_after is not None:
+                            print(f"[Sanity] mel_out min={mel_after.min():.3f}  max={mel_after.max():.3f}  mean={mel_after.mean():.3f}")
+                        print(f"[Sanity] loss={loss.item():.4f}")
 
                     # Scaled Backward Pass
                     scaler.scale(loss / self.GRAD_ACCUM_STEPS).backward()
@@ -642,24 +657,28 @@ class SpeechT5WavLM(torch.nn.Module):
                         scheduler.step()
                         optimizer.zero_grad()
 
-                    epoch_loss += loss.item()
+                    loss_val = loss.item()  # Extract scalar before freeing graph
+                    epoch_loss += loss_val
                     num_batches += 1
-                    pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                    pbar.set_postfix({"loss": f"{loss_val:.4f}"})
                     
-                    if step_callback is not None:
-                        # Ensure we don't hold references to GPU tensors in the callback
-                        step_callback(
-                            step=global_step,
-                            loss=loss.item(),
-                            target_mel=labels.detach().cpu(),
-                            pred_mel=mel_after.detach().cpu()
-                        )
-                    
-                    # Aggressive Cleanup
-                    del encoder_out, outputs, loss, mel_after
-                    if (step + 1) % 10 == 0:
+                    if step_callback is not None and mel_after is not None:
+                        # Detach and move to CPU before the GPU tensors are freed
+                        cb_target = labels.detach().cpu()
+                        cb_pred   = mel_after.detach().cpu()
+                        # Free GPU tensors first, then invoke callback on CPU copies
+                        del encoder_out, outputs, loss, mel_after, input_values, attention_mask, labels, speaker_embeddings
+                        encoder_out = outputs = loss = mel_after = None
+                        input_values = attention_mask = labels = speaker_embeddings = None
+                        torch.cuda.empty_cache()
+                        step_callback(step=global_step, loss=loss_val, target_mel=cb_target, pred_mel=cb_pred)
+                        del cb_target, cb_pred
+                    else:
+                        # No callback — free GPU tensors immediately
+                        del encoder_out, outputs, loss, mel_after, input_values, attention_mask, labels, speaker_embeddings
                         torch.cuda.empty_cache()
 
+                pbar.close()
                 avg_loss = epoch_loss / max(num_batches, 1)
                 print(f"[{phase_name}] Epoch {actual_epoch} Avg Loss: {avg_loss:.4f}")
                 
@@ -676,7 +695,7 @@ class SpeechT5WavLM(torch.nn.Module):
             print(f"\nTraining interrupted during {phase_name} phase!")
             raise
 
-    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5, coarse_epochs=0, step_callback=None):
+    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5, coarse_epochs=0, weight_decay=0.01, step_callback=None, use_lr_decay=True):
         """
         Fine-tune the hybrid WavLM → SpeechT5 pipeline using a two-phase Coarse-to-Fine approach.
         """
@@ -730,7 +749,7 @@ class SpeechT5WavLM(torch.nn.Module):
             list(self.wavlm_proj.parameters()) +
             list(self.encoder_spk_proj.parameters())
         )
-        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
         scaler = torch.amp.GradScaler('cuda')  # Updated from deprecated torch.cuda.amp.GradScaler
 
         # Calculate total steps for Inverse Square Root Decay scheduler
@@ -745,7 +764,11 @@ class SpeechT5WavLM(torch.nn.Module):
             # Inverse Square Root Decay after warmup
             return (warmup_steps ** 0.5) / (max(1, current_step) ** 0.5)
 
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        if use_lr_decay:
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        else:
+            # Constant LR — correct for memorization tests
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
         
         # 6. Validate dataset shapes before any training begins
         SpeechT5WavLMDataset.validate_dataset(paired_ds, num_samples=100)
