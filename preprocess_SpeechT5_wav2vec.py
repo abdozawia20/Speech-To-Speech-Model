@@ -23,6 +23,7 @@ def main():
     # Wav2VecSpeechT5Encoder for English (source)
     en_encoder = Wav2VecSpeechT5Encoder(load_decoder=False)
     # SpeechT5MelSpectrogramEncoder for German (target)
+    # This produces 80-bin log-mel spectrograms compatible with SpeechT5
     de_encoder = SpeechT5MelSpectrogramEncoder()
     
     # 3. Data Processing Loop
@@ -41,14 +42,12 @@ def main():
         de_audio = de_sample['audio']['array']
         
         # Map English audio through Wav2Vec encoder -> (1, Seq_Len, 768)
-        # en_encoder.encode returns a torch.Tensor on CPU
         en_hidden_states = en_encoder.encode(en_audio)
         
         # Map German audio through Mel Spectrogram encoder -> (1, Seq_Len, 80)
-        # de_encoder.encode returns inputs.input_values (typically a list/array)
+        # SpeechT5MelSpectrogramEncoder returns (1, Seq_Len, 80)
         de_mel_features = de_encoder.encode(de_audio)
         
-        # Ensure de_mel_features is a tensor or numpy array for consistency
         if isinstance(de_mel_features, list):
             de_mel_features = torch.tensor(de_mel_features)
         elif isinstance(de_mel_features, np.ndarray):
@@ -57,7 +56,7 @@ def main():
         # Standardize shapes to (Seq_Len, Hidden/Mel) for saving
         # en_hidden_states is (1, S, 768) -> (S, 768)
         en_hidden_states = en_hidden_states.squeeze(0)
-        # de_mel_features is likely (S, 80) or (1, S, 80) depending on processor
+        # de_mel_features is (1, S, 80) -> (S, 80)
         if de_mel_features.ndim == 3:
             de_mel_features = de_mel_features.squeeze(0)
             
