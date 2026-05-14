@@ -161,14 +161,15 @@ class SpeechT5WavLMDataset(Dataset):
         }
 
     @staticmethod
-    def validate_dataset(paired_ds, num_samples=50, reduction_factor=2):
+    def validate_dataset(paired_ds, num_samples=50):
         """
         Spot-check up to `num_samples` rows from the dataset for shape correctness.
         Raises ValueError on the first malformed row found.
 
         Checks performed per row:
           - Source (input_values) is reshapeable to (Seq, 768) with no remainder.
-          - Target (labels) has 80 mel bins and length divisible by reduction_factor.
+          - Target (labels) has 80 mel bins (T may be any positive integer;
+            trimming to be divisible by reduction_factor is the collate function's job).
           - Neither source nor target contain NaN or Inf values.
         """
         import random
@@ -195,13 +196,6 @@ class SpeechT5WavLMDataset(Dataset):
             if tgt_2d.ndim == 2 and tgt_2d.shape[1] != 80:
                 raise ValueError(
                     f"Row {idx}: target shape {tgt_2d.shape} — expected 80 mel bins."
-                )
-
-            # Target time-axis must be divisible by reduction_factor
-            T = tgt_2d.shape[0] if tgt_2d.ndim == 2 else tgt.shape[0]
-            if T % reduction_factor != 0:
-                raise ValueError(
-                    f"Row {idx}: target length {T} is not divisible by reduction_factor={reduction_factor}."
                 )
 
             # No NaN or Inf in source or target
@@ -754,7 +748,7 @@ class SpeechT5WavLM(torch.nn.Module):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
         # 6. Validate dataset shapes before any training begins
-        SpeechT5WavLMDataset.validate_dataset(paired_ds, num_samples=100, reduction_factor=2)
+        SpeechT5WavLMDataset.validate_dataset(paired_ds, num_samples=100)
 
         global_step = 0
         
