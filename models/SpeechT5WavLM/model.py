@@ -30,31 +30,28 @@ class Conv1DBridge(nn.Module):
     """
     Revised Bridge using LayerNorm for BATCH_SIZE=1 stability.
     """
-    def __init__(self, dim=768, kernel_size=5):
+    def __init__(self, dim=768, kernel_size=5, n_layers=4):
         super().__init__()
         padding = kernel_size // 2
-        self.conv1 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
-        self.act1 = nn.GELU()
-        self.norm1 = nn.LayerNorm(dim)
+        self.n_layers = n_layers
         
-        self.conv2 = nn.Conv1d(dim, dim, kernel_size, padding=padding)
-        self.act2 = nn.GELU()
-        self.norm2 = nn.LayerNorm(dim)
+        self.convs = nn.ModuleList([
+            nn.Conv1d(dim, dim, kernel_size, padding=padding)
+            for _ in range(n_layers)
+        ])
+        self.acts = nn.ModuleList([nn.GELU() for _ in range(n_layers)])
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(n_layers)])
 
     def forward(self, x):
         # x shape: (Batch, Seq, Dim)
         residual = x
         
-        # Conv1d expects (Batch, Dim, Seq)
-        x = x.transpose(1, 2)
-        x = self.conv1(x)
-        x = x.transpose(1, 2)
-        x = self.norm1(self.act1(x))
-        
-        x = x.transpose(1, 2)
-        x = self.conv2(x)
-        x = x.transpose(1, 2)
-        x = self.norm2(self.act2(x))
+        for i in range(self.n_layers):
+            # Conv1d expects (Batch, Dim, Seq)
+            x = x.transpose(1, 2)
+            x = self.convs[i](x)
+            x = x.transpose(1, 2)
+            x = self.norms[i](self.acts[i](x))
 
         return x + residual
 
@@ -321,7 +318,17 @@ class SpeechT5WavLM(torch.nn.Module):
         self.target_embeddings = None
 
         # Trainable Adapter/Projection layer to align WavLM space with SpeechT5
-        self.wavlm_proj = Conv1DBridge(dim=768, kernel_size=5).to(self.device)
+        self.wavlm_proj = Conv1DBridge(dim=768, kernel_size=5, n_layers=4).to(self.device)
+
+        # Freeze SpeechT5 decoder prenet
+        if hasattr(self.model.speecht5.decoder, "prenet"):
+            for p in self.model.speecht5.decoder.prenet.parameters():
+                p.requires_grad_(False)
+                
+        # Freeze SpeechT5 speech decoder postnet (mel residual refinement)
+        if hasattr(self.model.speech_decoder_postnet, "layers"):
+            for p in self.model.speech_decoder_postnet.layers.parameters():
+                p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -337,11 +344,14 @@ class SpeechT5WavLM(torch.nn.Module):
                 if hasattr(self.model.speecht5.encoder, "wrapped_encoder")
                 else self.model.speecht5.encoder,
             "SpeechT5 decoder":             self.model.speecht5.decoder,
+            "SpeechT5 decoder prenet":      self.model.speecht5.decoder.prenet
+                if hasattr(self.model.speecht5.decoder, "prenet") else None,
             "SpeechT5 speech postnet":      self.model.speech_decoder_postnet,
             "Conv1DBridge (wavlm_proj)":     self.wavlm_proj,
         }
         print("\n--- Trainable Parameter Audit ---")
         for name, module in sections.items():
+            if module is None: continue
             total   = sum(p.numel() for p in module.parameters())
             trained = sum(p.numel() for p in module.parameters() if p.requires_grad)
             print(f"  {name:<42} {trained:>10,} / {total:>10,} params trainable")
