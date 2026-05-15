@@ -624,9 +624,9 @@ class SpeechT5WavLM(torch.nn.Module):
             )
             # decoder_out.last_hidden_state: (B, 1, 768)
             # Apply postnet to get the mel prediction for these 2 frames
-            pred_2x = self.model.speech_decoder_postnet.postnet(
-                decoder_out.last_hidden_state
-            )  # (B, 1, 160)
+            feat_out = self.model.speech_decoder_postnet.feat_out(decoder_out.last_hidden_state)  # (B, 1, 160)
+            postnet_out = self.model.speech_decoder_postnet.postnet(feat_out)                     # (B, 1, 160)
+            pred_2x = feat_out + postnet_out                                                       # residual connection
             pred_frames = pred_2x.reshape(B, 2, mel)  # (B, 2, 80)
             prev_pred   = pred_2x.squeeze(1)           # (B, 160) — input to next step
 
