@@ -98,29 +98,95 @@ class SpeechT5WavLMDataset(Dataset):
         'input_values' : WavLM hidden states,  shape (Seq_Len, 768)  — source (EN)
         'labels'       : 80-bin mel-spectrogram, shape (T, 80)       — target (DE)
 
-    This avoids maintaining two separate language directories and ensures that
-    every (source, target) pair is always correctly aligned.
+    Set cache_in_ram=True (the default) to pre-load all samples as CPU tensors
+    at __init__ time so __getitem__ becomes an O(1) RAM lookup with zero I/O,
+    zero Arrow deserialisation, and zero numpy allocation during training.
+    Set cache_in_ram=False to fall back to the original on-demand loading path
+    (useful when dataset size exceeds available RAM).
     """
-    def __init__(self, paired_ds, processor, speaker_embeddings):
+    def __init__(self, paired_ds, processor, speaker_embeddings, cache_in_ram=True):
         """
         Args:
             paired_ds         : HuggingFace Dataset with columns ['input_values', 'labels']
             processor         : SpeechT5Processor (kept for potential fallback / tokenisation)
             speaker_embeddings: 1-D tensor of shape (512,) — fallback target-language x-vector
+            cache_in_ram      : If True, convert every row to CPU tensors once and store in
+                                self._cache.  __getitem__ then does a plain list lookup.
         """
-        self.paired_ds = paired_ds
         self.processor = processor
         self.speaker_embeddings = speaker_embeddings
+        self._cache = None
+
+        if cache_in_ram:
+            print(f"[Dataset] Pre-loading {len(paired_ds)} samples into RAM...")
+            self._cache = []
+            for i in range(len(paired_ds)):
+                row = paired_ds[int(i)]
+
+                # SOURCE: WavLM hidden states (Seq_Len, 768)
+                src_val = np.array(row["input_values"], dtype=np.float32)
+                if src_val.ndim == 1:
+                    if src_val.size % 768 == 0:
+                        src_val = src_val.reshape(-1, 768)
+                    else:
+                        raise ValueError(
+                            f"[Dataset] Row {i}: source size {src_val.size} not divisible by 768."
+                        )
+                source_features = torch.tensor(src_val, dtype=torch.float32)
+
+                # TARGET: 80-bin log-mel spectrogram (T, 80)
+                tgt_val = np.array(row["labels"], dtype=np.float32)
+                if tgt_val.ndim == 1:
+                    if tgt_val.size % 80 == 0:
+                        tgt_val = tgt_val.reshape(-1, 80)
+                    else:
+                        raise ValueError(
+                            f"[Dataset] Row {i}: target size {tgt_val.size} not divisible by 80."
+                        )
+                elif tgt_val.ndim == 3:
+                    tgt_val = tgt_val.squeeze(0)
+                target_features = torch.tensor(tgt_val, dtype=torch.float32)
+                if target_features.shape[0] == 80 and target_features.shape[1] != 80:
+                    target_features = target_features.transpose(0, 1)
+
+                # SPEAKER: 512-dim x-vector
+                if "speaker_embeddings" in row:
+                    spk_emb = torch.tensor(
+                        np.array(row["speaker_embeddings"], dtype=np.float32),
+                        dtype=torch.float32,
+                    )
+                else:
+                    spk_emb = self.speaker_embeddings.clone()
+
+                self._cache.append({
+                    "input_values":       source_features,
+                    "labels":             target_features,
+                    "speaker_embeddings": spk_emb,
+                })
+
+                if (i + 1) % 500 == 0 or (i + 1) == len(paired_ds):
+                    print(f"[Dataset] Cached {i + 1}/{len(paired_ds)} samples...", end="\r")
+
+            print(f"\n[Dataset] RAM cache complete. {len(self._cache)} tensors loaded.")
+        else:
+            # Fall back to on-demand loading (original behaviour)
+            self.paired_ds = paired_ds
 
     def __len__(self):
-        return len(self.paired_ds)
+        return len(self._cache) if self._cache is not None else len(self.paired_ds)
 
     def __getitem__(self, idx):
+        if self._cache is not None:
+            # O(1) RAM lookup — no I/O, no numpy conversion, no Arrow deserialisation
+            assert self._cache is not None  # guard: confirms cached path is taken
+            return self._cache[idx]
+
+        # ------------------------------------------------------------------ #
+        # On-demand fallback path (cache_in_ram=False)                        #
+        # ------------------------------------------------------------------ #
         row = self.paired_ds[int(idx)]
 
-        # ------------------------------------------------------------------
         # SOURCE: WavLM hidden states  (Seq_Len, 768)
-        # ------------------------------------------------------------------
         src_val = np.array(row["input_values"], dtype=np.float32)
         if src_val.ndim == 1:
             if src_val.size % 768 == 0:
@@ -129,9 +195,7 @@ class SpeechT5WavLMDataset(Dataset):
                 raise ValueError(f"[Dataset] WavLM source has unexpected size {src_val.size}")
         source_features = torch.tensor(src_val, dtype=torch.float32)
 
-        # ------------------------------------------------------------------
         # TARGET: 80-bin log-mel spectrogram  (T, 80)
-        # ------------------------------------------------------------------
         tgt_val = np.array(row["labels"], dtype=np.float32)
         if tgt_val.ndim == 1:
             if tgt_val.size % 80 == 0:
@@ -146,11 +210,12 @@ class SpeechT5WavLMDataset(Dataset):
         if target_features.shape[0] == 80 and target_features.shape[1] != 80:
             target_features = target_features.transpose(0, 1)
 
-        # ------------------------------------------------------------------
         # SPEAKER: 512-dim x-vector
-        # ------------------------------------------------------------------
         if "speaker_embeddings" in row:
-            spk_emb = torch.tensor(row["speaker_embeddings"], dtype=torch.float32)
+            spk_emb = torch.tensor(
+                np.array(row["speaker_embeddings"], dtype=np.float32),
+                dtype=torch.float32,
+            )
         else:
             spk_emb = self.speaker_embeddings
 
@@ -492,9 +557,99 @@ class SpeechT5WavLM(torch.nn.Module):
             return speech.cpu().numpy(), spectrogram.squeeze().cpu().numpy()
         return speech.cpu().numpy()
 
-    def _train_phase(self, paired_ds, epochs, learning_rate, batch_size, saving_checkpoint,
+    def _forward_with_scheduled_sampling(self, encoder_hidden_states, attention_mask,
+                                          speaker_embeddings, labels, sampling_rate):
+        """
+        Teacher-forced forward pass where each decoder input frame is replaced with
+        the model's previous prediction with probability `sampling_rate`.
+
+        When sampling_rate == 0.0 this is identical to the standard HF forward pass.
+        When sampling_rate == 1.0 this is fully autoregressive (no ground-truth inputs).
+
+        Args:
+            encoder_hidden_states : (B, Seq, 768) pre-computed encoder output
+            attention_mask        : (B, Seq) encoder attention mask
+            speaker_embeddings    : (B, 512)
+            labels                : (B, T, 80) target mel frames (with -100 padding)
+            sampling_rate         : float in [0, 1]
+
+        Returns:
+            loss (scalar tensor), spectrogram (B, T, 80)
+        """
+        import torch.nn.functional as F
+
+        # Identify valid (non-padding) frame positions
+        valid_mask = (labels != -100.0).any(dim=-1)   # (B, T)
+        B, T_full, mel = labels.shape
+        T_half = T_full // 2
+
+        # Build shifted inputs: SpeechT5 reduction_factor=2 means pairs of frames
+        # are concatenated before feeding to the decoder prenet.
+        # shifted[b, 0]   = zeros  (BOS frame)
+        # shifted[b, t>0] = labels[b, t-1]  with prob (1-p)
+        #                 = model_pred[b, t-1] with prob p
+        shifted = torch.zeros_like(labels)
+        shifted[:, 1:] = labels[:, :-1].clone()
+
+        # Reshape to (B, T_half, 160) — each step processes a pair of frames
+        shifted_2x = shifted.reshape(B, T_half, mel * 2)
+
+        spectrogram_frames = []
+        prev_pred = None     # (B, 160) — model's prediction for the previous step
+
+        loss_acc = torch.tensor(0.0, device=labels.device)
+        n_steps  = 0
+
+        for t in range(T_half):
+            # Decide whether to use teacher frame or model's previous prediction
+            if t > 0 and prev_pred is not None and sampling_rate > 0.0:
+                use_model = (torch.rand(B, device=labels.device) < sampling_rate)  # (B,)
+                current_input = torch.where(
+                    use_model.unsqueeze(-1),
+                    prev_pred,                        # model's prediction for step t-1
+                    shifted_2x[:, t, :],              # ground-truth frame pair for step t
+                )
+            else:
+                current_input = shifted_2x[:, t, :]  # (B, 160)
+
+            # Single decoder step with cached encoder hidden states
+            decoder_out = self.model.speecht5.decoder(
+                input_values=current_input.unsqueeze(1),   # (B, 1, 160)
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=attention_mask,
+                speaker_embeddings=speaker_embeddings,
+                use_cache=False,
+                return_dict=True,
+            )
+            # decoder_out.last_hidden_state: (B, 1, 768)
+            # Apply postnet to get the mel prediction for these 2 frames
+            pred_2x = self.model.speech_decoder_postnet.postnet(
+                decoder_out.last_hidden_state
+            )  # (B, 1, 160)
+            pred_frames = pred_2x.reshape(B, 2, mel)  # (B, 2, 80)
+            prev_pred   = pred_2x.squeeze(1)           # (B, 160) — input to next step
+
+            spectrogram_frames.append(pred_frames)
+
+            # Per-step L1 loss against ground truth (ignore -100 padding)
+            gt_frames  = labels[:, t * 2:(t + 1) * 2, :]     # (B, 2, 80)
+            frame_mask = valid_mask[:, t * 2:(t + 1) * 2]    # (B, 2)
+            if frame_mask.any():
+                step_loss = F.l1_loss(
+                    pred_frames[frame_mask], gt_frames[frame_mask], reduction="mean"
+                )
+                loss_acc = loss_acc + step_loss
+                n_steps += 1
+
+        spectrogram = torch.cat(spectrogram_frames, dim=1)  # (B, T_full, 80)
+        loss = loss_acc / max(n_steps, 1)
+
+        return loss, spectrogram
+
+    def _train_phase(self, train_dataset, epochs, learning_rate, batch_size, saving_checkpoint,
                      optimizer, scaler, scheduler, coarse_mode=False, global_step=0,
-                     start_epoch=0, total_epochs_label=None, step_callback=None):
+                     start_epoch=0, total_epochs_label=None, step_callback=None,
+                     scheduled_sampling_max_rate=0.0, total_training_steps=None):
         """
         Internal method to handle a single training phase (Coarse or Fine).
 
@@ -502,6 +657,11 @@ class SpeechT5WavLM(torch.nn.Module):
         time axis (labels[:, ::2, :]) — model.config.reduction_factor is never
         changed from its initialised value of 2, because the decoder prenet's
         Linear weight is frozen to shape (256, 80*2=160) at load time.
+
+        Args:
+            train_dataset: A pre-built SpeechT5WavLMDataset instance. Built once
+                           in fine_tune() and shared across phases to avoid
+                           rebuilding the RAM cache for coarse and fine phases.
         """
         if epochs <= 0:
             return global_step
@@ -516,15 +676,17 @@ class SpeechT5WavLM(torch.nn.Module):
         gc.collect()
         if hasattr(self.model, "gradient_checkpointing_disable"):
             self.model.gradient_checkpointing_disable()
-        
-        # 1. Setup Dataset and DataLoader
-        train_dataset = SpeechT5WavLMDataset(
-            paired_ds,
-            self.processor,
-            self.target_embeddings
-        )
 
-        # Collate always uses reduction_factor=2 — the model config is never changed.
+        # 1. Setup DataLoader
+        # The dataset is built once in fine_tune() and passed in here so the
+        # RAM cache is not constructed twice when coarse_epochs > 0.
+        #
+        # With cache_in_ram=True the dataset is an O(1) list lookup — spawning
+        # worker processes would only add RAM pressure (each worker receives a
+        # full pickled copy of the cache, tripling memory usage).  num_workers=0
+        # is the correct pairing when the cache is active.
+        # pin_memory=True is still beneficial: it places collated batches in
+        # page-locked host memory for fast async DMA to the GPU.
         collate_fn = partial(wavlm_speecht5_collate_fn, reduction_factor=2)
 
         train_loader = DataLoader(
@@ -532,13 +694,15 @@ class SpeechT5WavLM(torch.nn.Module):
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=0,       # 0 = main process only; avoids pinned-memory worker leak
-            pin_memory=False,    # pin_memory with workers accumulates across epochs
+            num_workers=0,            # O(1) cache: workers only add RAM overhead
+            pin_memory=True,          # async GPU transfer via page-locked memory
+            persistent_workers=False, # irrelevant with num_workers=0
         )
 
         # 2. Training state
         self.model.train()
         self.wavlm_proj.train()
+        self.encoder_spk_proj.train()  # keeps dropout-ready if added later
 
         # 3. Epoch Loop
         try:
@@ -551,6 +715,12 @@ class SpeechT5WavLM(torch.nn.Module):
                 optimizer.zero_grad()
 
                 pbar = tqdm(train_loader, desc=f"[{phase_name}] Epoch {actual_epoch}/{display_total}")
+
+                # Compute current scheduled-sampling rate (linear ramp 0 → max)
+                if scheduled_sampling_max_rate > 0.0 and total_training_steps:
+                    current_ss_rate = scheduled_sampling_max_rate * (global_step / total_training_steps)
+                else:
+                    current_ss_rate = 0.0
 
                 for step, (input_values, attention_mask, labels, speaker_embeddings) in enumerate(pbar):
                     if step == 0 and epoch_idx == 0:
@@ -581,25 +751,44 @@ class SpeechT5WavLM(torch.nn.Module):
                     loss        = None
                     mel_after   = None
 
+                    # Recompute current_ss_rate at step level (per-step accuracy)
+                    if scheduled_sampling_max_rate > 0.0 and total_training_steps:
+                        current_ss_rate = scheduled_sampling_max_rate * (global_step / total_training_steps)
+                    else:
+                        current_ss_rate = 0.0
+
+                    if global_step == 1:
+                        print(f"[SS] Scheduled sampling rate at step 1: {current_ss_rate:.6f}")
+
                     # Mixed Precision Forward Pass
                     with torch.amp.autocast('cuda'):
                         # 1. Encode WavLM states
                         encoder_out = self._encode_wavlm_states(input_values, speaker_embeddings, attention_mask)
 
-                        # 2. Native HF Forward Pass
-                        # By passing `labels`, HF automatically handles shift_spectrograms_right, 
-                        # generates the correct decoder_attention_mask, and calculates the exact Triple Loss.
-                        outputs = self.model(
-                            encoder_outputs=(encoder_out.last_hidden_state,),
-                            attention_mask=attention_mask, # HF uses this correctly for cross-attention
-                            speaker_embeddings=speaker_embeddings,
-                            labels=labels,
-                            use_cache=False,
-                            return_dict=True,
-                        )
-                        
-                        loss = outputs.loss
-                        mel_after = outputs.spectrogram  # Extract the predicted mel for visualization callback
+                        if current_ss_rate > 0.0:
+                            # Scheduled sampling path: step-by-step with mixed inputs
+                            loss, mel_after = self._forward_with_scheduled_sampling(
+                                encoder_hidden_states=encoder_out.last_hidden_state,
+                                attention_mask=attention_mask,
+                                speaker_embeddings=speaker_embeddings,
+                                labels=labels,
+                                sampling_rate=current_ss_rate,
+                            )
+                            outputs = None  # no HF output object in this path
+                        else:
+                            # 2. Native HF Forward Pass
+                            # By passing `labels`, HF automatically handles shift_spectrograms_right,
+                            # generates the correct decoder_attention_mask, and calculates the exact Triple Loss.
+                            outputs = self.model(
+                                encoder_outputs=(encoder_out.last_hidden_state,),
+                                attention_mask=attention_mask,  # HF uses this correctly for cross-attention
+                                speaker_embeddings=speaker_embeddings,
+                                labels=labels,
+                                use_cache=False,
+                                return_dict=True,
+                            )
+                            loss     = outputs.loss
+                            mel_after = outputs.spectrogram  # Extract the predicted mel for visualization callback
 
                     # Fallback: SpeechT5ForSpeechToSpeech may return None for loss
                     # (e.g. with non-default reduction_factor). Compute L1 mel reconstruction loss manually.
@@ -666,17 +855,19 @@ class SpeechT5WavLM(torch.nn.Module):
                         # Detach and move to CPU before the GPU tensors are freed
                         cb_target = labels.detach().cpu()
                         cb_pred   = mel_after.detach().cpu()
-                        # Free GPU tensors first, then invoke callback on CPU copies
+                        # Free GPU tensors first, then invoke callback on CPU copies.
+                        # torch.cuda.empty_cache() is intentionally NOT called here —
+                        # it is a GPU sync point that stalls every step. PyTorch's
+                        # caching allocator reuses freed memory without a flush.
                         del encoder_out, outputs, loss, mel_after, input_values, attention_mask, labels, speaker_embeddings
                         encoder_out = outputs = loss = mel_after = None
                         input_values = attention_mask = labels = speaker_embeddings = None
-                        torch.cuda.empty_cache()
                         step_callback(step=global_step, loss=loss_val, target_mel=cb_target, pred_mel=cb_pred)
                         del cb_target, cb_pred
                     else:
-                        # No callback — free GPU tensors immediately
+                        # No callback — free GPU tensors immediately.
+                        # torch.cuda.empty_cache() intentionally omitted here (GPU sync point).
                         del encoder_out, outputs, loss, mel_after, input_values, attention_mask, labels, speaker_embeddings
-                        torch.cuda.empty_cache()
 
                 pbar.close()
                 avg_loss = epoch_loss / max(num_batches, 1)
@@ -687,7 +878,17 @@ class SpeechT5WavLM(torch.nn.Module):
                 gc.collect()
 
                 if actual_epoch % saving_checkpoint == 0:
+                    # Stash training state on the instance so save() can persist it
+                    self._pending_optimizer_state = optimizer.state_dict()
+                    self._pending_scheduler_state = scheduler.state_dict()
+                    self._pending_scaler_state    = scaler.state_dict()
+                    self._pending_global_step     = global_step
                     self.save(f"checkpoint_epoch_{actual_epoch}")
+                    # Clear stash after save to avoid keeping large dicts in memory
+                    del self._pending_optimizer_state
+                    del self._pending_scheduler_state
+                    del self._pending_scaler_state
+                    del self._pending_global_step
 
             return global_step
 
@@ -695,7 +896,7 @@ class SpeechT5WavLM(torch.nn.Module):
             print(f"\nTraining interrupted during {phase_name} phase!")
             raise
 
-    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5, coarse_epochs=0, weight_decay=0.01, step_callback=None, use_lr_decay=True):
+    def fine_tune(self, preprocessed_path, epochs, learning_rate, batch_size, saving_checkpoint=5, coarse_epochs=0, weight_decay=0.01, step_callback=None, use_lr_decay=True, scheduled_sampling_max_rate=0.0):
         """
         Fine-tune the hybrid WavLM → SpeechT5 pipeline using a two-phase Coarse-to-Fine approach.
         """
@@ -735,11 +936,18 @@ class SpeechT5WavLM(torch.nn.Module):
         self._log_trainable_params()
         
         # 4. Initialize Projection (Residual Bypass Hack)
-        # Ensure the bridge starts close to an identity mapping
-        nn.init.dirac_(self.wavlm_proj.conv1.weight)
-        nn.init.zeros_(self.wavlm_proj.conv1.bias)
-        nn.init.zeros_(self.wavlm_proj.conv2.weight)
-        nn.init.zeros_(self.wavlm_proj.conv2.bias)
+        # Guard: only reset the bridge to near-identity on a genuinely fresh
+        # start.  When load() has been called first, _loaded_from_checkpoint is
+        # True and the restored weights are preserved.
+        if not getattr(self, '_loaded_from_checkpoint', False):
+            print("[Init] Conv1DBridge initialised to near-identity (fresh start).")
+            nn.init.dirac_(self.wavlm_proj.conv1.weight)
+            nn.init.zeros_(self.wavlm_proj.conv1.bias)
+            nn.init.zeros_(self.wavlm_proj.conv2.weight)
+            nn.init.zeros_(self.wavlm_proj.conv2.bias)
+        else:
+            print("[Init] Conv1DBridge weights retained from checkpoint (resumed run).")
+            self._loaded_from_checkpoint = False  # reset so next fresh start works
 
         total_epochs = coarse_epochs + epochs
 
@@ -769,29 +977,70 @@ class SpeechT5WavLM(torch.nn.Module):
         else:
             # Constant LR — correct for memorization tests
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+        # ── Restore training state if loaded from checkpoint (Task 1) ──────────
+        if hasattr(self, '_saved_optimizer_state'):
+            optimizer.load_state_dict(self._saved_optimizer_state)
+            del self._saved_optimizer_state
+            print("[Setup] Optimizer state restored — momentum and LR resume from checkpoint.")
+            if hasattr(scheduler, 'get_last_lr'):
+                try:
+                    print(f"[Setup] Restored LR: {scheduler.get_last_lr()}")
+                except Exception:
+                    pass
+
+        if hasattr(self, '_saved_scheduler_state'):
+            scheduler.load_state_dict(self._saved_scheduler_state)
+            del self._saved_scheduler_state
+            print("[Setup] Scheduler step count restored.")
+
+        if hasattr(self, '_saved_scaler_state'):
+            scaler.load_state_dict(self._saved_scaler_state)
+            del self._saved_scaler_state
+            print("[Setup] GradScaler state restored.")
+
+        global_step = getattr(self, '_saved_global_step', 0)
+        if hasattr(self, '_saved_global_step'):
+            del self._saved_global_step
+            print(f"[Setup] Resuming from global step {global_step}.")
         
         # 6. Validate dataset shapes before any training begins
         SpeechT5WavLMDataset.validate_dataset(paired_ds, num_samples=100)
 
-        global_step = 0
-        
+        # 7. Build the dataset cache ONCE and share across both phases.
+        # Building it here means coarse + fine phases reuse the same in-RAM
+        # tensors instead of each _train_phase call allocating its own copy.
+        print("[Setup] Building dataset RAM cache (shared across all phases)...")
+        train_dataset = SpeechT5WavLMDataset(
+            paired_ds,
+            self.processor,
+            self.target_embeddings,
+            cache_in_ram=True,
+        )
+
+        # global_step is already set above (0 for fresh start, or restored value)
+
         try:
             # PHASE A: Coarse Training
             if coarse_epochs > 0:
                 global_step = self._train_phase(
-                    paired_ds, coarse_epochs, learning_rate, batch_size, saving_checkpoint,
+                    train_dataset, coarse_epochs, learning_rate, batch_size, saving_checkpoint,
                     optimizer=optimizer, scaler=scaler, scheduler=scheduler, coarse_mode=True,
                     global_step=global_step, start_epoch=0, total_epochs_label=total_epochs,
-                    step_callback=step_callback
+                    step_callback=step_callback,
+                    scheduled_sampling_max_rate=scheduled_sampling_max_rate,
+                    total_training_steps=total_training_steps,
                 )
                 print("\n>>> Phase A (Coarse) complete. Transitioning to Phase B (Fine)...")
 
             # PHASE B: Fine-grained Training
-            self._train_phase(
-                paired_ds, epochs, learning_rate, batch_size, saving_checkpoint,
+            global_step = self._train_phase(
+                train_dataset, epochs, learning_rate, batch_size, saving_checkpoint,
                 optimizer=optimizer, scaler=scaler, scheduler=scheduler, coarse_mode=False,
                 global_step=global_step, start_epoch=coarse_epochs, total_epochs_label=total_epochs,
-                step_callback=step_callback
+                step_callback=step_callback,
+                scheduled_sampling_max_rate=scheduled_sampling_max_rate,
+                total_training_steps=total_training_steps,
             )
 
             print("\nTraining completed successfully.")
@@ -799,6 +1048,10 @@ class SpeechT5WavLM(torch.nn.Module):
 
         except KeyboardInterrupt:
             print("\nTraining interrupted! Saving current progress...")
+            self._pending_optimizer_state = optimizer.state_dict()
+            self._pending_scheduler_state = scheduler.state_dict()
+            self._pending_scaler_state    = scaler.state_dict()
+            self._pending_global_step     = global_step
             self.save("speecht5_wavlm_interrupted")
             print("Saved to 'speecht5_wavlm_interrupted'. Exiting safely.")
         except Exception as e:
@@ -868,6 +1121,24 @@ class SpeechT5WavLM(torch.nn.Module):
         if self.target_embeddings is not None:
             np.save(os.path.join(path, "speaker_embedding.npy"), self.target_embeddings.numpy())
 
+        # ── Task 1: Save optimizer/scheduler/scaler state if stashed ─────────
+        if hasattr(self, '_pending_optimizer_state'):
+            torch.save(self._pending_optimizer_state,
+                       os.path.join(path, "optimizer.pth"))
+            print("[Save] Optimizer state saved.")
+
+        if hasattr(self, '_pending_scheduler_state'):
+            torch.save(self._pending_scheduler_state,
+                       os.path.join(path, "scheduler.pth"))
+
+        if hasattr(self, '_pending_scaler_state'):
+            torch.save(self._pending_scaler_state,
+                       os.path.join(path, "scaler.pth"))
+
+        if hasattr(self, '_pending_global_step'):
+            with open(os.path.join(path, "global_step.json"), "w") as f:
+                json.dump({"global_step": self._pending_global_step}, f)
+
         # Save metadata
         metadata = {
             "wavlm_model_name": self.wavlm_model_name,
@@ -875,6 +1146,7 @@ class SpeechT5WavLM(torch.nn.Module):
         }
         with open(os.path.join(path, "metadata.json"), "w") as f:
             json.dump(metadata, f)
+        print(f"[Save] Checkpoint written to '{path}'.")
 
     def load(self, path):
         model_path = os.path.join(path, "model")
@@ -906,3 +1178,30 @@ class SpeechT5WavLM(torch.nn.Module):
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
             self.target_embeddings = torch.tensor(np.load(emb_path))
+
+        # Signal to fine_tune() that bridge weights came from a checkpoint and
+        # must NOT be overwritten by the near-identity re-initialisation.
+        self._loaded_from_checkpoint = True
+        print("[Load] Checkpoint loaded. Conv1DBridge weights will be preserved on fine_tune().")
+
+        # ── Task 1: Stash training state for fine_tune() to apply ─────────────
+        opt_path = os.path.join(path, "optimizer.pth")
+        if os.path.exists(opt_path):
+            self._saved_optimizer_state = torch.load(opt_path, map_location="cpu")
+            print("[Load] Optimizer state found — LR and momentum will resume from checkpoint.")
+        else:
+            print("[Load] No optimizer state found — optimizer will restart from scratch.")
+
+        sched_path = os.path.join(path, "scheduler.pth")
+        if os.path.exists(sched_path):
+            self._saved_scheduler_state = torch.load(sched_path, map_location="cpu")
+
+        scaler_path = os.path.join(path, "scaler.pth")
+        if os.path.exists(scaler_path):
+            self._saved_scaler_state = torch.load(scaler_path, map_location="cpu")
+
+        step_path = os.path.join(path, "global_step.json")
+        if os.path.exists(step_path):
+            with open(step_path) as f:
+                self._saved_global_step = json.load(f)["global_step"]
+            print(f"[Load] Resuming from global step {self._saved_global_step}.")
