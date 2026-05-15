@@ -949,10 +949,17 @@ class SpeechT5WavLM(torch.nn.Module):
         # True and the restored weights are preserved.
         if not getattr(self, '_loaded_from_checkpoint', False):
             print("[Init] Conv1DBridge initialised to near-identity (fresh start).")
-            nn.init.dirac_(self.wavlm_proj.conv1.weight)
+            # Near-zero but non-zero: both convs learn from step 1
+            nn.init.kaiming_normal_(self.wavlm_proj.conv1.weight, nonlinearity='relu')
             nn.init.zeros_(self.wavlm_proj.conv1.bias)
-            nn.init.zeros_(self.wavlm_proj.conv2.weight)
+            nn.init.kaiming_normal_(self.wavlm_proj.conv2.weight, nonlinearity='relu')
             nn.init.zeros_(self.wavlm_proj.conv2.bias)
+            
+            # Scale down the residual path so the identity path dominates initially,
+            # but gradients still flow through conv2 from step 1
+            with torch.no_grad():
+                self.wavlm_proj.conv1.weight.mul_(0.01)
+                self.wavlm_proj.conv2.weight.mul_(0.01)
         else:
             print("[Init] Conv1DBridge weights retained from checkpoint (resumed run).")
             self._loaded_from_checkpoint = False  # reset so next fresh start works
