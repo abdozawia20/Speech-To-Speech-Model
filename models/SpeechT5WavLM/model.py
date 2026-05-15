@@ -598,9 +598,6 @@ class SpeechT5WavLM(torch.nn.Module):
         spectrogram_frames = []
         prev_pred = None     # (B, 160) — model's prediction for the previous step
 
-        loss_acc = torch.tensor(0.0, device=labels.device)
-        n_steps  = 0
-
         for t in range(T_half):
             # Decide whether to use teacher frame or model's previous prediction
             if t > 0 and prev_pred is not None and sampling_rate > 0.0:
@@ -632,20 +629,31 @@ class SpeechT5WavLM(torch.nn.Module):
 
             spectrogram_frames.append(pred_frames)
 
-            # Per-step L1 loss against ground truth (ignore -100 padding)
-            gt_frames  = labels[:, t * 2:(t + 1) * 2, :]     # (B, 2, 80)
-            frame_mask = valid_mask[:, t * 2:(t + 1) * 2]    # (B, 2)
-            if frame_mask.any():
-                step_loss = F.l1_loss(
-                    pred_frames[frame_mask], gt_frames[frame_mask], reduction="mean"
-                )
-                loss_acc = loss_acc + step_loss
-                n_steps += 1
-
         spectrogram = torch.cat(spectrogram_frames, dim=1)  # (B, T_full, 80)
-        loss = loss_acc / max(n_steps, 1)
+        
+        # Unified L1 loss calculation matching the non-SS path
+        T = min(spectrogram.shape[1], labels.shape[1])
+        valid = labels[:, :T, :] != -100.0
+        
+        if valid.any():
+            loss = F.l1_loss(
+                spectrogram[:, :T, :][valid], 
+                labels[:, :T, :][valid], 
+                reduction="mean"
+            )
+        else:
+            loss = None
 
         return loss, spectrogram
+
+    @staticmethod
+    def _compute_ss_rate(global_step, total_steps, max_rate):
+        if max_rate <= 0.0 or total_steps <= 0:
+            return 0.0
+        import math
+        midpoint = total_steps * 0.4  # ~50% of max_rate at 40% of training
+        steepness = 8.0 / total_steps
+        return max_rate / (1.0 + math.exp(-steepness * (global_step - midpoint)))
 
     def _train_phase(self, train_dataset, epochs, learning_rate, batch_size, saving_checkpoint,
                      optimizer, scaler, scheduler, coarse_mode=False, global_step=0,
@@ -717,9 +725,9 @@ class SpeechT5WavLM(torch.nn.Module):
 
                 pbar = tqdm(train_loader, desc=f"[{phase_name}] Epoch {actual_epoch}/{display_total}")
 
-                # Compute current scheduled-sampling rate (linear ramp 0 → max)
+                # Compute current scheduled-sampling rate (sigmoid ramp)
                 if scheduled_sampling_max_rate > 0.0 and total_training_steps:
-                    current_ss_rate = scheduled_sampling_max_rate * (global_step / total_training_steps)
+                    current_ss_rate = self._compute_ss_rate(global_step, total_training_steps, scheduled_sampling_max_rate)
                 else:
                     current_ss_rate = 0.0
 
@@ -754,7 +762,7 @@ class SpeechT5WavLM(torch.nn.Module):
 
                     # Recompute current_ss_rate at step level (per-step accuracy)
                     if scheduled_sampling_max_rate > 0.0 and total_training_steps:
-                        current_ss_rate = scheduled_sampling_max_rate * (global_step / total_training_steps)
+                        current_ss_rate = self._compute_ss_rate(global_step, total_training_steps, scheduled_sampling_max_rate)
                     else:
                         current_ss_rate = 0.0
 
