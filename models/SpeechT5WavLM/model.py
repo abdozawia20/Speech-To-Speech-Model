@@ -776,32 +776,39 @@ class SpeechT5WavLM(torch.nn.Module):
                             )
                             outputs = None  # no HF output object in this path
                         else:
-                            # 2. Native HF Forward Pass
-                            # By passing `labels`, HF automatically handles shift_spectrograms_right,
-                            # generates the correct decoder_attention_mask, and calculates the exact Triple Loss.
+                            # 2. Parallel Teacher Forcing without HF Triple Loss
+                            # We manually shift labels to create decoder_input_values
+                            decoder_input_values = self.model._shift_right(labels)
+                            
                             outputs = self.model(
                                 encoder_outputs=(encoder_out.last_hidden_state,),
-                                attention_mask=attention_mask,  # HF uses this correctly for cross-attention
+                                attention_mask=attention_mask,
+                                decoder_input_values=decoder_input_values,
                                 speaker_embeddings=speaker_embeddings,
-                                labels=labels,
+                                labels=None,  # Skips HF triple loss computation
                                 use_cache=False,
                                 return_dict=True,
                             )
-                            loss     = outputs.loss
-                            mel_after = outputs.spectrogram  # Extract the predicted mel for visualization callback
-
-                    # Fallback: SpeechT5ForSpeechToSpeech may return None for loss
-                    # (e.g. with non-default reduction_factor). Compute L1 mel reconstruction loss manually.
-                    if loss is None:
-                        if mel_after is not None:
+                            mel_after = outputs.spectrogram
+                            
                             T = min(mel_after.shape[1], labels.shape[1])
-                            loss = torch.nn.functional.l1_loss(mel_after[:, :T, :], labels[:, :T, :])
-                        else:
-                            print(f"[Warning] Both outputs.loss and outputs.spectrogram are None at step {global_step}. Skipping batch.")
-                            optimizer.zero_grad()
-                            del encoder_out, outputs, input_values, attention_mask, labels, speaker_embeddings
-                            torch.cuda.empty_cache()
-                            continue
+                            valid = labels[:, :T, :] != -100.0
+                            
+                            if valid.any():
+                                loss = torch.nn.functional.l1_loss(
+                                    mel_after[:, :T, :][valid], 
+                                    labels[:, :T, :][valid], 
+                                    reduction="mean"
+                                )
+                            else:
+                                loss = None
+
+                    if loss is None:
+                        print(f"[Warning] loss is None at step {global_step} (no valid labels). Skipping batch.")
+                        optimizer.zero_grad()
+                        del encoder_out, outputs, input_values, attention_mask, labels, speaker_embeddings
+                        torch.cuda.empty_cache()
+                        continue
 
                     # NaN/Inf loss guard — skip corrupted batches rather than crash
                     if not torch.isfinite(loss):
