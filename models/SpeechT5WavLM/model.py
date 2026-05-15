@@ -322,9 +322,6 @@ class SpeechT5WavLM(torch.nn.Module):
 
         # Trainable Adapter/Projection layer to align WavLM space with SpeechT5
         self.wavlm_proj = Conv1DBridge(dim=768, kernel_size=5).to(self.device)
-        
-        # Speaker projection for injection into the encoder pre-net (Paper v2)
-        self.encoder_spk_proj = nn.Linear(512, 768).to(self.device)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -342,7 +339,6 @@ class SpeechT5WavLM(torch.nn.Module):
             "SpeechT5 decoder":             self.model.speecht5.decoder,
             "SpeechT5 speech postnet":      self.model.speech_decoder_postnet,
             "Conv1DBridge (wavlm_proj)":     self.wavlm_proj,
-            "encoder_spk_proj":             self.encoder_spk_proj,
         }
         print("\n--- Trainable Parameter Audit ---")
         for name, module in sections.items():
@@ -416,10 +412,7 @@ class SpeechT5WavLM(torch.nn.Module):
         # 1. Pass through the Conv1D Bridge
         projected_states = self.wavlm_proj(hidden_states)
 
-        # 2. Inject Speaker Embeddings (Paper Design)
-        # speaker_embeddings: (Batch, 512) -> (Batch, 1, 768)
-        spk_proj = self.encoder_spk_proj(speaker_embeddings).unsqueeze(1)
-        projected_states = projected_states + spk_proj
+        # 2. (Removed) Speaker Embeddings are only applied in the decoder now.
         
         # 3. Access encoder components
         encoder = self.model.speecht5.encoder
@@ -447,7 +440,6 @@ class SpeechT5WavLM(torch.nn.Module):
         """
         self.model.eval()
         self.wavlm_proj.eval()
-        self.encoder_spk_proj.eval()
 
         # 1. Prepare speaker embedding
         if speaker_embedding is not None:
@@ -505,7 +497,6 @@ class SpeechT5WavLM(torch.nn.Module):
         self.model.eval()
         self.vocoder.eval()
         self.wavlm_proj.eval()
-        self.encoder_spk_proj.eval()
 
         # Handle shapes
         if wavlm_hidden_states.ndim == 2:
@@ -711,7 +702,6 @@ class SpeechT5WavLM(torch.nn.Module):
         # 2. Training state
         self.model.train()
         self.wavlm_proj.train()
-        self.encoder_spk_proj.train()  # keeps dropout-ready if added later
 
         # 3. Epoch Loop
         try:
@@ -846,7 +836,7 @@ class SpeechT5WavLM(torch.nn.Module):
                         # Grad norm diagnostic — fires at step 1 and every ~2 epochs thereafter
                         steps_per_epoch_approx = max(1, len(train_loader))
                         if global_step == 1 or global_step % (steps_per_epoch_approx * 2) == 0:
-                            for name, param in [("wavlm_proj", self.wavlm_proj), ("encoder_spk_proj", self.encoder_spk_proj)]:
+                            for name, param in [("wavlm_proj", self.wavlm_proj)]:
                                 grad_norm = sum(
                                     p.grad.norm().item() ** 2 for p in param.parameters() if p.grad is not None
                                 ) ** 0.5
@@ -854,7 +844,6 @@ class SpeechT5WavLM(torch.nn.Module):
 
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         torch.nn.utils.clip_grad_norm_(self.wavlm_proj.parameters(), max_norm=1.0)
-                        torch.nn.utils.clip_grad_norm_(self.encoder_spk_proj.parameters(), max_norm=1.0)
                         
                         # Scaled Optimizer Step
                         scaler.step(optimizer)
@@ -977,8 +966,7 @@ class SpeechT5WavLM(torch.nn.Module):
         # 5. Setup Optimizer and Scheduler (Hoisted to persist across phases)
         trainable_params = (
             list(filter(lambda p: p.requires_grad, self.model.parameters())) +
-            list(self.wavlm_proj.parameters()) +
-            list(self.encoder_spk_proj.parameters())
+            list(self.wavlm_proj.parameters())
         )
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
         scaler = torch.amp.GradScaler('cuda')  # Updated from deprecated torch.cuda.amp.GradScaler
@@ -1139,7 +1127,6 @@ class SpeechT5WavLM(torch.nn.Module):
 
         # Save custom projection weights
         torch.save(self.wavlm_proj.state_dict(),        os.path.join(path, "wavlm_proj.pth"))
-        torch.save(self.encoder_spk_proj.state_dict(),  os.path.join(path, "encoder_spk_proj.pth"))
 
         # Save speaker embeddings
         if self.target_embeddings is not None:
@@ -1187,17 +1174,10 @@ class SpeechT5WavLM(torch.nn.Module):
             print("Loading custom Conv1DBridge weights...")
             self.wavlm_proj.load_state_dict(torch.load(proj_path, map_location=self.device))
 
-        spk_proj_path = os.path.join(path, "encoder_spk_proj.pth")
-        if os.path.exists(spk_proj_path):
-            print("Loading encoder_spk_proj weights...")
-            self.encoder_spk_proj.load_state_dict(torch.load(spk_proj_path, map_location=self.device))
-
         self.model.to(self.device)
         self.wavlm_proj.to(self.device)
-        self.encoder_spk_proj.to(self.device)
         self.model.eval()
         self.wavlm_proj.eval()
-        self.encoder_spk_proj.eval()
 
         emb_path = os.path.join(path, "speaker_embedding.npy")
         if os.path.exists(emb_path):
