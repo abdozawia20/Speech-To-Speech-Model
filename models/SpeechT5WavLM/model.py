@@ -21,6 +21,7 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import gc
+import math
 from functools import partial
 from speechbrain.inference.speaker import EncoderClassifier
 
@@ -976,8 +977,9 @@ class SpeechT5WavLM(torch.nn.Module):
         def lr_lambda(current_step):
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
-            # Inverse Square Root Decay after warmup
-            return (warmup_steps ** 0.5) / (max(1, current_step) ** 0.5)
+            # Cosine decay after warmup
+            progress = float(current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         if use_lr_decay:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
