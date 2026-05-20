@@ -52,9 +52,10 @@ if project_root not in sys.path:
 
 from encoders import VQGANEncoder
 
-BANDWIDTH    = 1.5
-TOKEN_OFFSET = 100_000
-NUM_CODEBOOKS = 2  # at 1.5 kbps
+BANDWIDTH     = 1.5
+TOKEN_OFFSET  = 100_000
+NUM_CODEBOOKS = 2     # at 1.5 kbps
+CODEBOOK_SIZE = 1024  # EnCodec codebook entries per codebook at 1.5 kbps
 
 class OmniPhiS2ST(nn.Module):
     """
@@ -85,7 +86,8 @@ class OmniPhiS2ST(nn.Module):
                 torch_dtype=torch.bfloat16,
                 _attn_implementation="sdpa",   # use flash_attention_2 if available
                 trust_remote_code=True,
-                device_map="auto",
+                # device_map="auto", # for local
+                device_map={"": 0}, # for colab
             )
         else:
             self.phi4 = AutoModelForCausalLM.from_pretrained(
@@ -157,7 +159,7 @@ class OmniPhiS2ST(nn.Module):
         self,
         source_audio: np.ndarray,
         source_sr: int = 16000,
-        max_new_tokens: int = 800,
+        max_new_tokens: int = 200,   # 200 tokens ≈ 5s audio; keeps VRAM usage manageable
     ) -> np.ndarray:
         """
         End-to-end inference: English audio → german audio waveform.
@@ -172,7 +174,9 @@ class OmniPhiS2ST(nn.Module):
             numpy array: Synthesized target audio at 24kHz.
         """
         self.phi4.eval()
-        self.vqgan.model.eval().to(self.device)
+        # Keep VQGANEncoder on CPU during LLM generation to maximise free VRAM.
+        # It will be moved to device only for the final decode step.
+        self.vqgan.model.eval().cpu()
 
         # ── Step 1: Build prompt and process source audio ───────────────────
         user_message = {
@@ -193,14 +197,17 @@ class OmniPhiS2ST(nn.Module):
 
         # ── Step 2: Auto-regressively generate target token IDs ─────────────
         eos_id = self.processor.tokenizer.eos_token_id
+        torch.cuda.empty_cache()  # flush any leftover allocations before generation
+        print(f"[generate_speech] Generating up to {max_new_tokens} tokens on {self.device}...")
         generated_ids = self.phi4.generate(
             **inputs,
             input_mode=2,                   # speech mode
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_id,
             do_sample=False,                # greedy for determinism
-            num_logits_to_keep=1,           # only keep last token logits (saves memory + prevents -None TypeError)
+            num_logits_to_keep=1,           # only keep last token logits (saves memory)
         )
+        print(f"[generate_speech] Generation done. Total ids shape: {generated_ids.shape}")
 
         # Strip the prompt prefix; keep only newly generated tokens
         prompt_len    = inputs["input_ids"].shape[1]
@@ -215,8 +222,17 @@ class OmniPhiS2ST(nn.Module):
             print("[generate_speech] Warning: no audio tokens generated.")
             return np.zeros(16000, dtype=np.float32)
 
-        # ── Step 4: Reverse offset ───────────────────────────────────────────
+        # ── Step 4: Reverse offset & validate range ──────────────────────────
         raw_codes = [t - TOKEN_OFFSET for t in audio_token_ids]
+
+        # Clamp to valid codebook range to prevent CUDA out-of-bounds index
+        # assertions in EncodecVectorQuantization.decode() when the model
+        # generates tokens outside [TOKEN_OFFSET, TOKEN_OFFSET+CODEBOOK_SIZE-1].
+        oob = sum(1 for c in raw_codes if not (0 <= c < CODEBOOK_SIZE))
+        if oob > 0:
+            print(f"[generate_speech] Warning: {oob}/{len(raw_codes)} codes out-of-range — "
+                  f"model may not be sufficiently fine-tuned. Clamping to [0, {CODEBOOK_SIZE-1}].")
+        raw_codes = [max(0, min(c, CODEBOOK_SIZE - 1)) for c in raw_codes]
 
         # ── Step 5: Unflatten 1D → [1, Codebooks, Frames] ───────────────────
         #    We interleaved as [CB0_F0, CB1_F0, CB0_F1, CB1_F1, ...]
@@ -226,18 +242,24 @@ class OmniPhiS2ST(nn.Module):
 
         codes_array = np.array(raw_codes, dtype=np.int64).reshape(-1, NUM_CODEBOOKS)
         # codes_array shape: [Frames, Codebooks]
-        # EnCodec expects:   [Batch=1, Codebooks, Frames]
+        # EnCodec API expects audio_codes of shape [nb_frames, batch, codebooks, frames].
+        # With chunk_length=None (as in encodec_24khz) it does frame = audio_codes[0],
+        # so we wrap with two unsqueeze(0) calls: [Frames, Codebooks] → [1, 1, 2, Frames].
+        # Move VQGAN back to the compute device only for this decode step
+        self.vqgan.model.to(self.device)
         codes_tensor = (
             torch.tensor(codes_array, dtype=torch.long)
-            .T.unsqueeze(0)
+            .T                    # [Frames, CB] → [CB, Frames]
+            .unsqueeze(0)         # → [1, CB, Frames]  (batch dim)
+            .unsqueeze(0)         # → [1, 1, CB, Frames]  (nb_frames dim)
             .to(self.device)
-        )  # → [1, 2, Frames]
+        )  # → [nb_frames=1, batch=1, codebooks=2, frames]
 
         # ── Step 6: Decode with VQGANEncoder → audio waveform ───────────────
         #    EncodecModel.decode() expects (audio_codes, audio_scales)
-        #    audio_scales can be None for simple reconstruction.
+        #    audio_scales must be a list of length nb_frames; None means no scale.
         decoded = self.vqgan.model.decode(codes_tensor, [None])
-        # decoded[0] shape: [1, 1, T]  at 24kHz
+        # decoded.audio_values shape: [1, 1, T]  at 24kHz
         waveform = decoded.audio_values.squeeze().cpu().numpy()
 
         return waveform

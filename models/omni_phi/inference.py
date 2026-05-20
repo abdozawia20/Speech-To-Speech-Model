@@ -18,11 +18,14 @@ for path in [omni_phi_dir, project_root]:
 
 from model import OmniPhiS2ST
 
-BATCH_TOKEN_LIMIT = 200   # tokens per generation call (~5 seconds of audio at 1.5 kbps)
+BATCH_TOKEN_LIMIT = 200   # tokens per chunk ≈ 5 seconds of audio at 1.5 kbps
+MAX_BATCHES       = 10    # hard cap: 10 chunks × 5s = ~50s of output max
 
-def translate_speech(source_wav_path: str, output_wav_path: str = "output.wav", model: OmniPhiS2ST = None):
+def translate_speech(source_wav_path: str, output_wav_path: str = "output.wav", model: OmniPhiS2ST = None,
+                     max_new_tokens: int = 200):
     """
     Load a fine-tuned OmniPhiS2ST checkpoint and translate an audio file.
+    max_new_tokens: upper limit on generated audio tokens (200 ≈ 5s at 1.5 kbps).
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -43,26 +46,27 @@ def translate_speech(source_wav_path: str, output_wav_path: str = "output.wav", 
 
     # Run end-to-end generation
     print(f"[inference] Translating {source_wav_path} (sampling rate: {sr} Hz)...")
-    output_audio = model.generate_speech(audio, source_sr=sr)
+    output_audio = model.generate_speech(audio, source_sr=sr, max_new_tokens=max_new_tokens)
 
     # Save result at 24kHz (EnCodec's native output rate)
     sf.write(output_wav_path, output_audio, samplerate=24000)
     print(f"[inference] Done. Output saved to {output_wav_path}")
     return output_audio
 
-def translate_speech_batched(model: OmniPhiS2ST, source_audio: np.ndarray, source_sr: int = 16000):
+def translate_speech_batched(model: OmniPhiS2ST, source_audio: np.ndarray, source_sr: int = 16000,
+                             max_batches: int = MAX_BATCHES):
     """
-    Translates in batches of BATCH_TOKEN_LIMIT tokens.
-    Queues each batch and concatenates the final waveforms.
+    Translates in chunks of BATCH_TOKEN_LIMIT tokens, up to max_batches chunks.
+    Concatenates all chunk waveforms into the final output.
     """
     all_waveforms = []
-    remaining_audio = source_audio
 
-    print(f"[inference] Starting batched inference (token limit: {BATCH_TOKEN_LIMIT} per call)...")
-    while True:
+    print(f"[inference] Starting batched inference (token limit: {BATCH_TOKEN_LIMIT}/chunk, max {max_batches} chunks)...")
+    for batch_idx in range(max_batches):
+        print(f"[inference] Generating chunk {batch_idx + 1}/{max_batches}...")
         # Generate next batch of tokens
         chunk_waveform = model.generate_speech(
-            remaining_audio,
+            source_audio,
             source_sr=source_sr,
             max_new_tokens=BATCH_TOKEN_LIMIT,
         )
@@ -71,8 +75,10 @@ def translate_speech_batched(model: OmniPhiS2ST, source_audio: np.ndarray, sourc
         # Stop condition: model produced an EOS or very short output
         # less than 0.1s at 24kHz (2400 samples) indicates termination
         if len(chunk_waveform) < 2400:
-            print("[inference] Termination condition met (short chunk generated).")
+            print(f"[inference] Termination condition met at chunk {batch_idx + 1} (short chunk = EOS).")
             break
+    else:
+        print(f"[inference] Reached max_batches limit ({max_batches}). Stopping.")
 
     if len(all_waveforms) == 0:
         return np.zeros(2400, dtype=np.float32)
