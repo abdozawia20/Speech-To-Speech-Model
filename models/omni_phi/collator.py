@@ -29,8 +29,20 @@ def omni_phi_collate_fn(batch):
 
     attention_mask = (input_ids != 0).long()
 
-    # Concatenate audio embeddings along the batch dimension
-    input_audio_embeds = torch.cat(input_audio_embeds_list, dim=0)
+    # Pad and stack audio embeddings to support varying audio lengths in the batch
+    max_audio_len = max(e.size(1) for e in input_audio_embeds_list)
+    embed_dim = input_audio_embeds_list[0].size(2)
+    padded_embeds = []
+    for e in input_audio_embeds_list:
+        curr_len = e.size(1)
+        if curr_len < max_audio_len:
+            padding = e.new_zeros((1, max_audio_len - curr_len, embed_dim))
+            padded_e = torch.cat([e, padding], dim=1)
+        else:
+            padded_e = e
+        padded_embeds.append(padded_e)
+    
+    input_audio_embeds = torch.cat(padded_embeds, dim=0)
     audio_embed_sizes  = torch.cat(audio_embed_sizes_list)
 
     # Audio attention mask (True = real embedding, False = padding)

@@ -30,18 +30,26 @@ def main():
     print("==============================\n")
 
     # ── 1. Load model (LoRA adapter applied inside __init__) ────────────────
-    model = OmniPhiS2ST(phi4_model_id=MODEL_ID, device="cuda" if torch.cuda.is_available() else "cpu")
+    device = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model = OmniPhiS2ST(phi4_model_id=MODEL_ID, device=device)
 
     # ── 2. Load datasets ────────────────────────────────────────────────────
     train_dataset = OmniPhiDataset(str(DATA_DIR / "train.jsonl"), model.processor, training=True)
-    eval_dataset  = OmniPhiDataset(str(DATA_DIR / "eval.jsonl"),  model.processor, training=False)
+    eval_jsonl_path = DATA_DIR / "eval.jsonl"
+    if eval_jsonl_path.exists():
+        eval_dataset = OmniPhiDataset(str(eval_jsonl_path), model.processor, training=False)
+    else:
+        print(f"[train.py] {eval_jsonl_path} not found. Skipping evaluation dataset.")
+        eval_dataset = None
 
     # ── 3. Training arguments (mirrors the official Phi-4 script) ───────────
     training_args = TrainingArguments(
         output_dir                   = str(OUTPUT_DIR),
         num_train_epochs             = 1,
-        per_device_train_batch_size  = 4,
-        gradient_accumulation_steps  = 8,           # effective batch = 32
+        max_steps                    = 2,
+        per_device_train_batch_size  = 1,
+        gradient_accumulation_steps  = 2,          # Keep this small for testing so we reach 2 steps quickly
         gradient_checkpointing       = True,
         gradient_checkpointing_kwargs= {"use_reentrant": False},
         optim                        = "adamw_torch",

@@ -5,6 +5,37 @@ import torch.nn as nn
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+# Monkey-patch PEFT for Phi-4-multimodal-instruct compatibility
+# Phi-4's modeling_phi4mm.py was written against an older PEFT API that had:
+#   1. prepare_inputs_for_generation on Phi4MMModel (needed by PeftModelForCausalLM.__init__)
+#   2. active_adapter as a mutable list (now a read-only str property in peft>=0.8)
+try:
+    import peft
+    from peft.tuners.tuners_utils import BaseTuner
+
+    _orig_peft_causal_init = peft.peft_model.PeftModelForCausalLM.__init__
+    def _patched_peft_causal_init(self, model, peft_config, adapter_name="default"):
+        if not hasattr(model, "prepare_inputs_for_generation"):
+            model.prepare_inputs_for_generation = lambda *args, **kwargs: None
+        _orig_peft_causal_init(self, model, peft_config, adapter_name)
+    peft.peft_model.PeftModelForCausalLM.__init__ = _patched_peft_causal_init
+
+    class _AppendableStr(str):
+        """str subclass with a no-op append() for legacy peft API compatibility."""
+        def append(self, _):
+            pass
+
+    def get_active_adapter(self):
+        val = getattr(self, "_active_adapter_val", "default")
+        return _AppendableStr(val)
+
+    def set_active_adapter(self, value):
+        self._active_adapter_val = value
+
+    BaseTuner.active_adapter = property(get_active_adapter, set_active_adapter)
+except Exception:
+    pass
+
 # Add project root to sys.path so we can import encoders from the root directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
@@ -39,12 +70,21 @@ class OmniPhiS2ST(nn.Module):
         )
 
         print("[OmniPhiS2ST] Loading Phi-4 model...")
-        self.phi4 = AutoModelForCausalLM.from_pretrained(
-            phi4_model_id,
-            torch_dtype=torch.bfloat16,
-            _attn_implementation="sdpa",   # use flash_attention_2 if available
-            trust_remote_code=True,
-        ).to(device)
+        if device.startswith("cuda"):
+            self.phi4 = AutoModelForCausalLM.from_pretrained(
+                phi4_model_id,
+                torch_dtype=torch.bfloat16,
+                _attn_implementation="sdpa",   # use flash_attention_2 if available
+                trust_remote_code=True,
+                device_map="auto",
+            )
+        else:
+            self.phi4 = AutoModelForCausalLM.from_pretrained(
+                phi4_model_id,
+                torch_dtype=torch.bfloat16,
+                _attn_implementation="sdpa",   # use flash_attention_2 if available
+                trust_remote_code=True,
+            ).to(device)
 
         # Apply LoRA: freezes vision/text backbone; trains only speech adapter
         self.phi4.set_lora_adapter("speech")
@@ -53,10 +93,27 @@ class OmniPhiS2ST(nn.Module):
         # ── Target Codec Block (frozen) ──────────────────────────────────────
         print("[OmniPhiS2ST] Loading VQGANEncoder (EnCodec)...")
         self.vqgan = VQGANEncoder(model_name="facebook/encodec_24khz")
-        self.vqgan.model.eval().to(device)
+        self.vqgan.model.eval()
+        # Keep vqgan on CPU during training to save GPU VRAM
+        self.vqgan.model.to("cpu")
         for p in self.vqgan.model.parameters():
             p.requires_grad = False
-        print("[OmniPhiS2ST] VQGANEncoder frozen.")
+        print("[OmniPhiS2ST] VQGANEncoder frozen on CPU.")
+
+    @property
+    def hf_device_map(self):
+        val = getattr(self.phi4, "hf_device_map", None)
+        if val is None:
+            raise AttributeError("hf_device_map is not set on the base model")
+        return val
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if "_modules" in self.__dict__ and "phi4" in self._modules:
+                return getattr(self.phi4, name)
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def forward(
         self,
@@ -107,6 +164,7 @@ class OmniPhiS2ST(nn.Module):
             numpy array: Synthesized target audio at 24kHz.
         """
         self.phi4.eval()
+        self.vqgan.model.eval().to(self.device)
 
         # ── Step 1: Build prompt and process source audio ───────────────────
         user_message = {

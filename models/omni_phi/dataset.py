@@ -16,22 +16,29 @@ class OmniPhiDataset(Dataset):
     """
 
     def __init__(self, jsonl_path: str, processor: AutoProcessor, training: bool = True):
-        self.records  = []
-        self.processor = processor
-        self.training  = training
+        self.jsonl_path = jsonl_path
+        self.processor  = processor
+        self.training   = training
+        self.offsets    = []
 
-        print(f"[OmniPhiDataset] Loading records from {jsonl_path}...")
-        with open(jsonl_path) as f:
+        print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} to enable low-RAM lazy loading...")
+        with open(jsonl_path, "rb") as f:
+            offset = 0
             for line in f:
                 if line.strip():
-                    self.records.append(json.loads(line))
-        print(f"[OmniPhiDataset] Loaded {len(self.records)} records.")
+                    self.offsets.append(offset)
+                offset += len(line)
+        print(f"[OmniPhiDataset] Scanned {len(self.offsets)} records.")
 
     def __len__(self):
-        return len(self.records)
+        return len(self.offsets)
 
     def __getitem__(self, idx):
-        record = self.records[idx]
+        offset = self.offsets[idx]
+        with open(self.jsonl_path, "rb") as f:
+            f.seek(offset)
+            line = f.readline()
+        record = json.loads(line.decode("utf-8"))
 
         # 1. Source audio: raw 16kHz float32 array
         src_audio = np.array(record["source_audio"], dtype=np.float32)

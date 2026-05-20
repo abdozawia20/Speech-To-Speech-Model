@@ -118,55 +118,53 @@ def main():
         p.requires_grad = False
     print("VQGANEncoder frozen.")
 
-    # ── 3. Processing loop ──────────────────────────────────────────────────
-    records = []
-    print("Tokenizing and preprocessing parallel datasets...")
-    for i in tqdm(range(num_pairs), desc="Preprocessing"):
-        src_entry = src_ds[i]
-        tgt_entry = tgt_ds[i]
-
-        # Verify alignment
-        assert src_entry["id"] == tgt_entry["id"], f"ID mismatch at index {i}: {src_entry['id']} != {tgt_entry['id']}"
-
-        # Source Audio: 16kHz raw float32 array
-        src_audio = np.array(src_entry["audio"]["array"], dtype=np.float32)
-        src_sr = src_entry["audio"]["sampling_rate"]
-
-        # If source isn't 16000Hz, resample it (though dataset_loader should ensure 16000Hz)
-        if src_sr != 16000:
-            src_audio = librosa.resample(src_audio, orig_sr=src_sr, target_sr=16000)
-
-        # Target Audio: Convert to interleaved offset EnCodec tokens
-        tgt_audio = np.array(tgt_entry["audio"]["array"], dtype=np.float32)
-        tgt_sr = tgt_entry["audio"]["sampling_rate"]
-
-        # Run tokenization
-        try:
-            target_tokens = audio_to_tokens(
-                audio_array=tgt_audio,
-                vqgan=vqgan,
-                bandwidth=args.bandwidth,
-                token_offset=args.token_offset,
-                orig_sr=tgt_sr
-            )
-            
-            records.append({
-                "id": src_entry["id"],
-                "source_audio": src_audio.tolist(),   # serializable list
-                "target_tokens": target_tokens,
-            })
-        except Exception as e:
-            print(f"\nWarning: Skipped sample {src_entry['id']} due to error: {e}")
-            continue
-
-    # ── 4. Save to Disk as JSONL ────────────────────────────────────────────
+    # ── 3. Processing loop & Streaming to Disk ──────────────────────────────
     output_file = out_dir / f"{args.split}.jsonl"
-    print(f"Saving {len(records)} records to {output_file}...")
+    print(f"Tokenizing, preprocessing, and saving records directly to {output_file}...")
+    
+    saved_count = 0
     with open(output_file, "w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
+        for i in tqdm(range(num_pairs), desc="Preprocessing"):
+            src_entry = src_ds[i]
+            tgt_entry = tgt_ds[i]
+
+            # Verify alignment
+            assert src_entry["id"] == tgt_entry["id"], f"ID mismatch at index {i}: {src_entry['id']} != {tgt_entry['id']}"
+
+            # Source Audio: 16kHz raw float32 array
+            src_audio = np.array(src_entry["audio"]["array"], dtype=np.float32)
+            src_sr = src_entry["audio"]["sampling_rate"]
+
+            # If source isn't 16000Hz, resample it (though dataset_loader should ensure 16000Hz)
+            if src_sr != 16000:
+                src_audio = librosa.resample(src_audio, orig_sr=src_sr, target_sr=16000)
+
+            # Target Audio: Convert to interleaved offset EnCodec tokens
+            tgt_audio = np.array(tgt_entry["audio"]["array"], dtype=np.float32)
+            tgt_sr = tgt_entry["audio"]["sampling_rate"]
+
+            # Run tokenization
+            try:
+                target_tokens = audio_to_tokens(
+                    audio_array=tgt_audio,
+                    vqgan=vqgan,
+                    bandwidth=args.bandwidth,
+                    token_offset=args.token_offset,
+                    orig_sr=tgt_sr
+                )
+                
+                record = {
+                    "id": src_entry["id"],
+                    "source_audio": src_audio.tolist(),   # serializable list
+                    "target_tokens": target_tokens,
+                }
+                f.write(json.dumps(record) + "\n")
+                saved_count += 1
+            except Exception as e:
+                print(f"\nWarning: Skipped sample {src_entry['id']} due to error: {e}")
+                continue
             
-    print(f"SUCCESS: Preprocessing Phase 1 complete. Saved file size: {output_file.stat().st_size / 1024 / 1024:.2f} MB")
+    print(f"SUCCESS: Preprocessing Phase 1 complete. Saved {saved_count} records. File size: {output_file.stat().st_size / 1024 / 1024:.2f} MB")
 
 if __name__ == "__main__":
     main()
