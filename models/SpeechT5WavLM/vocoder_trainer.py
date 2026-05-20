@@ -198,15 +198,15 @@ class SpeechT5VocoderDataset(Dataset):
         waveform = row["target_waveform"].float().unsqueeze(0) # (1, T)
 
         if predicted_mel.ndim == 1:
-            predicted_mel = predicted_mel.reshape(-1, 128)
+            predicted_mel = predicted_mel.reshape(-1, 80)
 
         if target_features.ndim == 1:
-            if target_features.numel() % 128 == 0:
-                target_features = target_features.reshape(-1, 128)
+            if target_features.numel() % 80 == 0:
+                target_features = target_features.reshape(-1, 80)
         elif target_features.ndim == 3:
             target_features = target_features.squeeze(0)
 
-        if target_features.shape[0] == 128 and target_features.shape[1] != 128:
+        if target_features.shape[0] == 80 and target_features.shape[1] != 80:
             target_features = target_features.transpose(0, 1)
 
         if target_features.shape[0] % 2 != 0:
