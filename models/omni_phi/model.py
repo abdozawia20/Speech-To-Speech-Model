@@ -36,6 +36,15 @@ try:
 except Exception:
     pass
 
+# Monkey-patch Cache and DynamicCache to support get_usable_length in newer transformers versions
+try:
+    from transformers.cache_utils import Cache, DynamicCache
+    for cache_cls in (Cache, DynamicCache):
+        if not hasattr(cache_cls, "get_usable_length"):
+            cache_cls.get_usable_length = lambda self, new_seq_length, layer_idx=0: self.get_seq_length(layer_idx)
+except Exception:
+    pass
+
 # Add project root to sys.path so we can import encoders from the root directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
@@ -94,11 +103,10 @@ class OmniPhiS2ST(nn.Module):
         print("[OmniPhiS2ST] Loading VQGANEncoder (EnCodec)...")
         self.vqgan = VQGANEncoder(model_name="facebook/encodec_24khz")
         self.vqgan.model.eval()
-        # Keep vqgan on CPU during training to save GPU VRAM
-        self.vqgan.model.to("cpu")
+        self.vqgan.model.to(device)
         for p in self.vqgan.model.parameters():
             p.requires_grad = False
-        print("[OmniPhiS2ST] VQGANEncoder frozen on CPU.")
+        print(f"[OmniPhiS2ST] VQGANEncoder frozen on {device}.")
 
     @property
     def hf_device_map(self):
@@ -180,6 +188,9 @@ class OmniPhiS2ST(nn.Module):
             return_tensors="pt",
         ).to(self.device)
 
+        # Remove input_mode if it's already in inputs to prevent duplicate argument error in generate()
+        inputs.pop("input_mode", None)
+
         # ── Step 2: Auto-regressively generate target token IDs ─────────────
         eos_id = self.processor.tokenizer.eos_token_id
         generated_ids = self.phi4.generate(
@@ -188,6 +199,7 @@ class OmniPhiS2ST(nn.Module):
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_id,
             do_sample=False,                # greedy for determinism
+            num_logits_to_keep=1,           # only keep last token logits (saves memory + prevents -None TypeError)
         )
 
         # Strip the prompt prefix; keep only newly generated tokens

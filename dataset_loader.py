@@ -18,7 +18,7 @@ sys.path.append(project_root)
 # ---------------------------------------------------------------------------
 # GLOBAL CONFIGURATION
 # ---------------------------------------------------------------------------
-NUM_PROC = 4
+NUM_PROC = 1
 DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
 
 # Supported languages for CVSS (to English)
