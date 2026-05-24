@@ -2,7 +2,7 @@ import sys
 import os
 from pathlib import Path
 import torch
-from transformers import Trainer, TrainingArguments
+from transformers import TrainingArguments
 
 # Resolve paths relative to this script's directory for maximum robustness
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -19,6 +19,7 @@ for path in [omni_phi_dir, project_root]:
 from model    import OmniPhiS2ST
 from dataset  import OmniPhiDataset
 from collator import omni_phi_collate_fn
+from trainer  import OmniPhiTrainer
 
 MODEL_ID    = "microsoft/Phi-4-multimodal-instruct"
 
@@ -82,7 +83,7 @@ def main():
     )
 
     # ── 4. Instantiate Trainer ───────────────────────────────────────────────
-    trainer = Trainer(
+    trainer = OmniPhiTrainer(
         model         = model,
         args          = training_args,
         data_collator = omni_phi_collate_fn,

@@ -138,6 +138,23 @@ class OmniPhiS2ST(nn.Module):
                 return getattr(self.phi4, name)
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    def save_pretrained(self, save_directory, **kwargs):
+        """
+        Override save_pretrained to force safe_serialization=False.
+
+        Why: Phi-4 ties embed_tokens.weight ↔ lm_head.weight to the same tensor.
+        safetensors (the default) refuses to serialize shared-memory tensors and
+        raises a RuntimeError. Falling back to pytorch_model.bin (pickle) handles
+        tied weights correctly and loads identically with from_pretrained().
+
+        This override is called by BOTH trainer.save_model() AND the internal
+        _save_checkpoint, so it works regardless of which Trainer class is used.
+        """
+        kwargs["safe_serialization"] = False
+        import os
+        os.makedirs(save_directory, exist_ok=True)
+        self.phi4.save_pretrained(save_directory, **kwargs)
+
     def forward(
         self,
         input_ids,
