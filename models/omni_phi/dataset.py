@@ -1,6 +1,8 @@
 import json
+import os
 import numpy as np
 import torch
+from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
 
@@ -13,6 +15,12 @@ class OmniPhiDataset(Dataset):
     Loads preprocessed (source_audio, target_tokens) pairs.
     Formats them into the exact input structure expected by
     Phi-4-multimodal-instruct for causal language model training.
+
+    Performance: On first run, processor feature extraction (WavLM mel
+    features) is computed once per sample and cached to .pt files next to
+    the JSONL.  Subsequent epochs/runs skip all CPU feature extraction and
+    just torch.load() the pre-computed tensors — making the DataLoader
+    essentially I/O-bound rather than CPU-bound.
     """
 
     def __init__(self, jsonl_path: str, processor: AutoProcessor, training: bool = True):
@@ -21,7 +29,24 @@ class OmniPhiDataset(Dataset):
         self.training   = training
         self.offsets    = []
 
-        print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} to enable low-RAM lazy loading...")
+        # Cache directory lives alongside the JSONL file
+        split = "train" if training else "eval"
+        self.cache_dir = Path(jsonl_path).parent / f".cache_{split}"
+        self.cache_dir.mkdir(exist_ok=True)
+
+        # Pre-compute the static prompt text once (avoids repeated tokenizer calls)
+        user_message = {
+            "role": "user",
+            "content": f"<|audio_1|>\n{INSTRUCTION}",
+        }
+        self._prompt_text = self.processor.tokenizer.apply_chat_template(
+            [user_message], tokenize=False, add_generation_prompt=True
+        )
+        self._answer_ids = self.processor.tokenizer(
+            ANSWER_SUFFIX, return_tensors="pt"
+        ).input_ids  # [1, suffix_len] — computed once
+
+        print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} ...")
         with open(jsonl_path, "rb") as f:
             offset = 0
             for line in f:
@@ -30,65 +55,75 @@ class OmniPhiDataset(Dataset):
                 offset += len(line)
         print(f"[OmniPhiDataset] Scanned {len(self.offsets)} records.")
 
-    def __len__(self):
-        return len(self.offsets)
+        # Pre-warm cache on construction (single-threaded, runs once)
+        self._build_cache()
 
-    def __getitem__(self, idx):
+    def _build_cache(self):
+        """Run processor once per sample and persist tensors to disk."""
+        missing = [i for i in range(len(self.offsets))
+                   if not (self.cache_dir / f"{i}.pt").exists()]
+        if not missing:
+            print(f"[OmniPhiDataset] Cache already complete ({len(self.offsets)} samples). Skipping.")
+            return
+
+        print(f"[OmniPhiDataset] Building feature cache for {len(missing)} samples "
+              f"(this runs once — future epochs will load from disk)...")
+        for count, idx in enumerate(missing, 1):
+            self._compute_and_cache(idx)
+            if count % 100 == 0 or count == len(missing):
+                print(f"  Cached {count}/{len(missing)} samples...", flush=True)
+        print(f"[OmniPhiDataset] Cache complete. Saved to {self.cache_dir}")
+
+    def _compute_and_cache(self, idx: int):
+        """Run AutoProcessor on one sample and save the result."""
         offset = self.offsets[idx]
         with open(self.jsonl_path, "rb") as f:
             f.seek(offset)
             line = f.readline()
         record = json.loads(line.decode("utf-8"))
 
-        # 1. Source audio: raw 16kHz float32 array
-        src_audio = np.array(record["source_audio"], dtype=np.float32)
-
-        # 2. Target token IDs (already offset by +100,000 in preprocess_omni.py)
+        src_audio  = np.array(record["source_audio"], dtype=np.float32)
         target_ids = record["target_tokens"]
 
-        # 3. Build the user prompt (matches official Phi-4 chat template)
-        user_message = {
-            "role": "user",
-            "content": f"<|audio_1|>\n{INSTRUCTION}",
-        }
-        prompt_text = self.processor.tokenizer.apply_chat_template(
-            [user_message], tokenize=False, add_generation_prompt=True
-        )
-
-        # 4. Run the AutoProcessor: encodes the prompt text + source audio together.
-        #    This produces input_ids, input_audio_embeds, and audio_embed_sizes.
         inputs = self.processor(
-            text=prompt_text,
+            text=self._prompt_text,
             audios=[(src_audio, 16000)],
             return_tensors="pt",
         )
 
-        # 5. Build the answer token sequence and append the EOS suffix
-        answer_text = ANSWER_SUFFIX
-        answer_ids  = self.processor.tokenizer(
-            answer_text, return_tensors="pt"
-        ).input_ids  # shape: [1, suffix_len]
+        target_tensor   = torch.tensor(target_ids, dtype=torch.long).unsqueeze(0)
+        full_answer_ids = torch.cat([target_tensor, self._answer_ids], dim=1)
 
-        # Prepend target audio tokens to the answer
-        target_tensor = torch.tensor(target_ids, dtype=torch.long).unsqueeze(0)  # [1, N]
-        full_answer_ids = torch.cat([target_tensor, answer_ids], dim=1)          # [1, N + suffix_len]
+        torch.save({
+            "input_ids":          inputs.input_ids,
+            "input_audio_embeds": inputs.input_audio_embeds,
+            "audio_embed_sizes":  inputs.audio_embed_sizes,
+            "full_answer_ids":    full_answer_ids,
+        }, self.cache_dir / f"{idx}.pt")
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def __getitem__(self, idx):
+        # Load from cache — fast torch.load() instead of processor feature extraction
+        cached = torch.load(self.cache_dir / f"{idx}.pt", weights_only=True)
+
+        input_ids_prompt = cached["input_ids"]          # [1, prompt_len]
+        input_audio_embeds = cached["input_audio_embeds"]
+        audio_embed_sizes  = cached["audio_embed_sizes"]
+        full_answer_ids    = cached["full_answer_ids"]  # [1, N + suffix_len]
 
         if self.training:
-            # Concatenate prompt tokens + answer tokens into one sequence
-            input_ids = torch.cat([inputs.input_ids, full_answer_ids], dim=1)
-
-            # Build labels: mask the prompt portion with IGNORE_INDEX (-100)
-            # so the model only computes loss on the target audio tokens + suffix
-            labels = torch.full_like(input_ids, IGNORE_INDEX)
+            input_ids = torch.cat([input_ids_prompt, full_answer_ids], dim=1)
+            labels    = torch.full_like(input_ids, IGNORE_INDEX)
             labels[:, -full_answer_ids.shape[1]:] = full_answer_ids
         else:
-            # Eval mode: input is prompt only; labels are the ground-truth tokens
-            input_ids = inputs.input_ids
+            input_ids = input_ids_prompt
             labels    = full_answer_ids
 
         return {
             "input_ids":          input_ids,
             "labels":             labels,
-            "input_audio_embeds": inputs.input_audio_embeds,
-            "audio_embed_sizes":  inputs.audio_embed_sizes,
+            "input_audio_embeds": input_audio_embeds,
+            "audio_embed_sizes":  audio_embed_sizes,
         }

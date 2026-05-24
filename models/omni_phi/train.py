@@ -44,30 +44,41 @@ def main():
         eval_dataset = None
 
     # ── 3. Training arguments (mirrors the official Phi-4 script) ───────────
+    # ── Detect if fused AdamW is supported (requires CUDA + torch >= 2.0) ────
+    use_fused_adam = (
+        torch.cuda.is_available()
+        and hasattr(torch.optim, "AdamW")
+        and "fused" in torch.optim.AdamW.__init__.__doc__
+    ) if torch.cuda.is_available() else False
+    optim_choice = "adamw_torch_fused" if use_fused_adam else "adamw_torch"
+    print(f"[train.py] Using optimizer: {optim_choice}")
+
     training_args = TrainingArguments(
         output_dir                   = str(OUTPUT_DIR),
-        num_train_epochs             = 1,
-        max_steps                    = 2,
-        per_device_train_batch_size  = 1,
-        gradient_accumulation_steps  = 2,          # Keep this small for testing so we reach 2 steps quickly
+        num_train_epochs             = 5,
+        # max_steps                  = 2,           # REMOVED: was a debug cap
+        per_device_train_batch_size  = 2,            # A100 80GB can handle batch=2 with LoRA
+        gradient_accumulation_steps  = 8,            # effective batch = 16; larger = better GPU util
         gradient_checkpointing       = True,
         gradient_checkpointing_kwargs= {"use_reentrant": False},
-        optim                        = "adamw_torch",
+        optim                        = optim_choice, # fused AdamW: ~2x faster kernel launches
         adam_beta1                   = 0.9,
         adam_beta2                   = 0.95,
         adam_epsilon                 = 1e-7,
         learning_rate                = 4e-5,
         weight_decay                 = 0.01,
         max_grad_norm                = 1.0,
-        lr_scheduler_type            = "linear",
-        warmup_steps                 = 50,
-        logging_steps                = 10,
+        lr_scheduler_type            = "cosine",     # cosine > linear for LoRA fine-tuning
+        warmup_ratio                 = 0.03,         # 3% warmup, scales with total steps
+        logging_steps                = 5,
         save_strategy                = "epoch",
         bf16                         = torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        remove_unused_columns        = False,       # REQUIRED for custom batch keys
+        tf32                         = True,          # enable TF32 matmuls on A100 (free speedup)
+        remove_unused_columns        = False,        # REQUIRED for custom batch keys
         report_to                    = "none",
-        dataloader_num_workers       = 4,
-        ddp_find_unused_parameters   = True,        # for frozen SigLIP layers in Phi-4
+        dataloader_num_workers       = 2,            # 2 workers; heavy CPU processing is pre-cached
+        dataloader_pin_memory        = True,         # pinned memory → faster CPU→GPU transfers
+        ddp_find_unused_parameters   = False,        # LoRA only trains a subset; set True only for DDP multi-GPU
     )
 
     # ── 4. Instantiate Trainer ───────────────────────────────────────────────

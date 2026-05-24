@@ -5,6 +5,10 @@ import torch.nn as nn
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+# Enable TF32 on A100 for free ~10-20% speedup on matrix multiplications
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # Monkey-patch PEFT for Phi-4-multimodal-instruct compatibility
 # Phi-4's modeling_phi4mm.py was written against an older PEFT API that had:
 #   1. prepare_inputs_for_generation on Phi4MMModel (needed by PeftModelForCausalLM.__init__)
@@ -80,11 +84,20 @@ class OmniPhiS2ST(nn.Module):
         )
 
         print("[OmniPhiS2ST] Loading Phi-4 model...")
+        # Prefer FlashAttention-2 on A100 (much faster); fall back to SDPA if not installed
+        try:
+            import flash_attn  # noqa: F401
+            attn_impl = "flash_attention_2"
+            print("[OmniPhiS2ST] FlashAttention-2 detected — using flash_attention_2.")
+        except ImportError:
+            attn_impl = "sdpa"
+            print("[OmniPhiS2ST] flash_attn not installed — falling back to sdpa. "
+                  "Install with: pip install flash-attn --no-build-isolation")
         if device.startswith("cuda"):
             self.phi4 = AutoModelForCausalLM.from_pretrained(
                 phi4_model_id,
                 torch_dtype=torch.bfloat16,
-                _attn_implementation="sdpa",   # use flash_attention_2 if available
+                _attn_implementation=attn_impl,
                 trust_remote_code=True,
                 # device_map="auto", # for local
                 device_map={"": 0}, # for colab
