@@ -156,7 +156,25 @@ class OmniPhiS2ST(nn.Module):
         which corresponds exclusively to the target EnCodec token IDs.
         Phi-4 handles this internally because its LM head returns a standard
         CausalLMOutputWithPast with .loss already computed.
+
+        NOTE: The HF Trainer does NOT auto-move custom keys (input_audio_embeds,
+        audio_embed_sizes) to the GPU device — it only moves standard keys like
+        input_ids. We do it here explicitly to avoid a blocking implicit copy
+        inside Phi-4's forward pass that costs ~30-50ms per step.
         """
+        # Determine target device and dtype from the first trainable parameter
+        # (avoids hardcoding and works with device_map / multi-GPU layouts)
+        _param  = next(self.phi4.parameters())
+        _device = _param.device
+        _dtype  = _param.dtype   # bfloat16
+
+        # ── GPU placement + dtype cast (eliminates CPU→GPU copy inside Phi-4) ──
+        input_audio_embeds = input_audio_embeds.to(device=_device, dtype=_dtype, non_blocking=True)
+        audio_embed_sizes  = audio_embed_sizes.to(device=_device, non_blocking=True)
+
+        if audio_attention_mask is not None:
+            audio_attention_mask = audio_attention_mask.to(device=_device, non_blocking=True)
+
         return self.phi4(
             input_ids=input_ids,
             attention_mask=attention_mask,

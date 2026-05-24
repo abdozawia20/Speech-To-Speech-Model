@@ -7,6 +7,12 @@ def omni_phi_collate_fn(batch):
     """
     Pads a list of dataset items into a single batched BatchFeature.
     Labels for the prompt region are -100 (ignored by Cross-Entropy loss).
+
+    Perf notes:
+    - input_audio_embeds are cast to bfloat16 here (processor outputs float32).
+      This halves memory bandwidth for both CPU padding and the subsequent
+      CPU→GPU transfer (which the model's forward() does with non_blocking=True).
+    - pin_memory should be True in the DataLoader for fastest CPU→GPU transfer.
     """
     input_ids_list          = [item["input_ids"][0] for item in batch]
     labels_list             = [item["labels"][0]    for item in batch]
@@ -28,6 +34,11 @@ def omni_phi_collate_fn(batch):
     labels    = pad_sequence(labels_list,    padding_value=IGNORE_INDEX,  padding_side="left")
 
     attention_mask = (input_ids != 0).long()
+
+    # Cast audio embeds to bfloat16 before padding — the processor outputs float32
+    # but Phi-4 uses bfloat16, so we convert here to halve the memory footprint
+    # of the padded tensor and the subsequent CPU→GPU transfer.
+    input_audio_embeds_list = [e.to(dtype=torch.bfloat16) for e in input_audio_embeds_list]
 
     # Pad and stack audio embeddings to support varying audio lengths in the batch
     max_audio_len = max(e.size(1) for e in input_audio_embeds_list)

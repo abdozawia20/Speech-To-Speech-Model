@@ -96,7 +96,9 @@ class OmniPhiDataset(Dataset):
 
         torch.save({
             "input_ids":          inputs.input_ids,
-            "input_audio_embeds": inputs.input_audio_embeds,
+            # Store as bfloat16: halves cache file size and eliminates runtime
+            # dtype conversion in the collator. Phi-4 expects bfloat16 anyway.
+            "input_audio_embeds": inputs.input_audio_embeds.to(dtype=torch.bfloat16),
             "audio_embed_sizes":  inputs.audio_embed_sizes,
             "full_answer_ids":    full_answer_ids,
         }, self.cache_dir / f"{idx}.pt")
