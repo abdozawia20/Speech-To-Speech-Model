@@ -50,11 +50,25 @@ class OmniPhiTrainer(Trainer):
         phi4_model = self.model.phi4
         phi4_model.save_pretrained(output_dir, safe_serialization=False)
 
-        # Save processor / tokenizer if available
+        # Save processor / tokenizer if available.
+        # NOTE: Phi4MMProcessor.save_pretrained() crashes in transformers 4.57.3
+        # with AttributeError: 'audio_tokenizer'. Work around by saving the
+        # tokenizer sub-component directly — it contains all vocab/config needed
+        # for inference; audio processor parts load fine from the hub.
+        processor = None
         if self.processing_class is not None:
-            self.processing_class.save_pretrained(output_dir)
+            processor = self.processing_class
         elif hasattr(self.model, "processor"):
-            self.model.processor.save_pretrained(output_dir)
+            processor = self.model.processor
+
+        if processor is not None:
+            try:
+                processor.save_pretrained(output_dir)
+            except AttributeError:
+                # Phi4MMProcessor bug: falls back to tokenizer-only save
+                if hasattr(processor, "tokenizer"):
+                    processor.tokenizer.save_pretrained(output_dir)
+                    print("[OmniPhiTrainer] Saved tokenizer (processor.save_pretrained skipped due to Phi4MM bug).")
 
     def _save_checkpoint(self, model, trial, metrics=None):
         """

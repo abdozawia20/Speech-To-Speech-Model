@@ -95,7 +95,14 @@ def main():
     # ── 5. Train ─────────────────────────────────────────────────────────────
     trainer.train()
     trainer.save_model(str(OUTPUT_DIR))
-    model.processor.save_pretrained(str(OUTPUT_DIR))
+    # Save processor (Phi4MMProcessor.save_pretrained crashes in transformers 4.57.3
+    # with AttributeError: 'audio_tokenizer'. Fall back to tokenizer-only save.)
+    try:
+        model.processor.save_pretrained(str(OUTPUT_DIR))
+    except AttributeError:
+        if hasattr(model.processor, "tokenizer"):
+            model.processor.tokenizer.save_pretrained(str(OUTPUT_DIR))
+            print("[train.py] Saved tokenizer (processor.save_pretrained skipped due to Phi4MM bug).")
     print(f"[train.py] Training complete. Checkpoint saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
