@@ -73,6 +73,7 @@ def main():
         warmup_ratio                 = 0.03,         # 3% warmup, scales with total steps
         logging_steps                = 5,
         save_strategy                = "epoch",
+        save_safetensors             = False,         # CRITICAL: prevents tied-weight RuntimeError
         bf16                         = torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
         tf32                         = True,          # enable TF32 matmuls on A100 (free speedup)
         remove_unused_columns        = False,        # REQUIRED for custom batch keys
