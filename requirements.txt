@@ -21,3 +21,4 @@ python-multipart
 jiwer
 torchvision
 backoff
+ipywidgets
