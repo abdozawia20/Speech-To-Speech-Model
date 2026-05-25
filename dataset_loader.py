@@ -71,7 +71,7 @@ LID_BATCH_SIZE  = 64    # samples per LID batch — feed the thread pool generou
 # Default True: the GPU is typically occupied by the main speech model
 # (Phi-4, SpeechT5, etc.) and loading Whisper onto the same GPU causes VRAM OOM.
 # Set to False only if you have a dedicated second GPU with free VRAM.
-WHISPER_FORCE_CPU = True
+WHISPER_FORCE_CPU = False
 
 # Threading: CTranslate2 releases the Python GIL during matrix ops, so
 # ThreadPoolExecutor gives true parallelism for Whisper inference.
@@ -97,6 +97,39 @@ def _get_whisper_model(model_size="tiny"):
     global _shared_language_model
     if _shared_language_model is None:
         try:
+            # Fix for ctranslate2/faster-whisper not finding cuDNN 9 libraries on Linux
+            import platform
+            if platform.system() != "Windows":
+                try:
+                    import nvidia.cudnn
+                    import nvidia.cublas
+                    import ctypes
+                    
+                    cudnn_path = os.path.join(nvidia.cudnn.__path__[0], 'lib')
+                    cublas_path = os.path.join(nvidia.cublas.__path__[0], 'lib')
+                    
+                    # Load cuDNN libraries with RTLD_GLOBAL
+                    if os.path.exists(cudnn_path):
+                        for lib in os.listdir(cudnn_path):
+                            if "libcudnn" in lib and ".so.9" in lib:
+                                 try:
+                                      ctypes.CDLL(os.path.join(cudnn_path, lib), mode=ctypes.RTLD_GLOBAL)
+                                 except Exception:
+                                      pass
+
+                    # Load cuBLAS libraries with RTLD_GLOBAL
+                    if os.path.exists(cublas_path):
+                        try:
+                             ctypes.CDLL(os.path.join(cublas_path, "libcublas.so.12"), mode=ctypes.RTLD_GLOBAL)
+                             ctypes.CDLL(os.path.join(cublas_path, "libcublasLt.so.12"), mode=ctypes.RTLD_GLOBAL)
+                        except Exception:
+                            pass
+
+                except ImportError:
+                    pass # Optional nvidia libs not installed
+                except Exception as e:
+                    print(f"Warning: Error preloading nvidia libraries: {e}")
+
             from faster_whisper import WhisperModel
             if torch.cuda.is_available() and not WHISPER_FORCE_CPU:
                 device, compute_type = "cuda", "float16"
@@ -665,7 +698,8 @@ def _lid_filter_indices(ds, expected_lang, audio_col='audio',
     n = len(ds)
     lid_samples = int(lid_secs * 16000)  # max samples to feed Whisper
 
-    for i in range(n):
+    from tqdm import tqdm
+    for i in tqdm(range(n), desc=f"LID ({expected_lang})"):
         try:
             # Fetch EXACTLY ONE row — avoids batching decoded audio in RAM
             audio_field = ds[i][audio_col]

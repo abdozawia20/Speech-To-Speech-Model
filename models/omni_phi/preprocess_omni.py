@@ -18,12 +18,12 @@ from encoders import VQGANEncoder
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Phase 1: Target Tokenization & Preprocessing for Omni-Phi")
-    parser.add_argument("--dataset", type=str, default="fleurs", choices=["fleurs", "seamless_align"],
+    parser.add_argument("--dataset", type=str, default="seamless_align", choices=["fleurs", "seamless_align"],
                         help="Dataset to load ('fleurs' or 'seamless_align')")
     parser.add_argument("--lang_src", type=str, default="en", help="Source language code (default: en)")
     parser.add_argument("--lang_tgt", type=str, default="de", help="Target language code (default: de)")
     parser.add_argument("--split", type=str, default="train", help="Dataset split to preprocess (default: train)")
-    parser.add_argument("--num_samples", type=int, default=50000, help="Maximum number of samples to load")
+    parser.add_argument("--num_samples", type=int, default=15000, help="Maximum number of samples to load")
     parser.add_argument("--bandwidth", type=float, default=1.5, help="EnCodec bandwidth in kbps (default: 1.5 for 2 codebooks)")
     parser.add_argument("--token_offset", type=int, default=100000, help="Vocabulary offset for target tokens (default: 100000)")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for preprocessed JSONL files")
