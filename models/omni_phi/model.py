@@ -157,6 +157,7 @@ class OmniPhiS2ST(nn.Module):
 
         # Apply LoRA: freezes vision/text backbone; trains only speech adapter
         self.phi4.set_lora_adapter("speech")
+        self.phi4.enable_input_require_grads()
         print("[OmniPhiS2ST] LoRA speech adapter applied. Non-audio layers frozen.")
 
         # ── Target Codec Block (frozen) ──────────────────────────────────────
