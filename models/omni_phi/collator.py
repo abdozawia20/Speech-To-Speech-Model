@@ -30,8 +30,12 @@ def omni_phi_collate_fn(batch):
                 out[i, :seq.size(0)] = seq
         return out
 
-    input_ids = pad_sequence(input_ids_list, padding_value=0,            padding_side="left")
-    labels    = pad_sequence(labels_list,    padding_value=IGNORE_INDEX,  padding_side="left")
+    # 🚨 CRITICAL TRAINING UPDATE: Changed padding_side to "right"
+    # Left padding is only for autoregressive inference/generation.
+    # Training with left padding shifts the absolute position IDs of content tokens, 
+    # breaking the relative RoPE (Rotary Position Embeddings) consistency across sequences.
+    input_ids = pad_sequence(input_ids_list, padding_value=0,            padding_side="right")
+    labels    = pad_sequence(labels_list,    padding_value=IGNORE_INDEX,  padding_side="right")
 
     attention_mask = (input_ids != 0).long()
 

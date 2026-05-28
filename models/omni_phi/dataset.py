@@ -5,6 +5,7 @@ import torch
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import AutoProcessor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ANSWER_SUFFIX = "<|end|><|endoftext|>"
 IGNORE_INDEX  = -100
@@ -97,12 +98,26 @@ class OmniPhiDataset(Dataset):
                 "Delete the cache directory and restart to rebuild from the JSONL."
             )
 
-        print(f"[OmniPhiDataset] Building feature cache for {len(missing)} samples "
-              f"(this runs once — future epochs will load from disk)...")
-        for count, idx in enumerate(missing, 1):
-            self._compute_and_cache(idx)
-            if count % 100 == 0 or count == len(missing):
-                print(f"  Cached {count}/{len(missing)} samples...", flush=True)
+        # Determine optimal worker threads based on available CPU cores
+        num_workers = min(8, os.cpu_count() or 4)
+        print(f"[OmniPhiDataset] Rebuilding feature cache for {len(missing)} samples in parallel...")
+        print(f"                 Using {num_workers} parallel CPU worker threads...")
+
+        # Run multi-threaded caching
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(self._compute_and_cache, idx): idx for idx in missing}
+            
+            completed_count = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    future.result()
+                    completed_count += 1
+                    if completed_count % 500 == 0 or completed_count == len(missing):
+                        print(f"  Processed and cached {completed_count}/{len(missing)} samples...", flush=True)
+                except Exception as e:
+                    print(f"  [ERROR] Failed to cache sample index {idx}: {e}")
+
         print(f"[OmniPhiDataset] Cache complete. Saved to {self.cache_dir}")
 
     def _compute_and_cache(self, idx: int):
