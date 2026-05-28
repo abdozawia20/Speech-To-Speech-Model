@@ -235,6 +235,14 @@ class OmniPhiS2ST(nn.Module):
         input_audio_embeds = input_audio_embeds.to(device=_device, dtype=_dtype, non_blocking=True)
         audio_embed_sizes  = audio_embed_sizes.to(device=_device, non_blocking=True)
 
+        # 🚨 THE CRITICAL AUTOGRAD FIX 🚨
+        # Force the input audio embedding tensor to require gradients during training.
+        # This registers the entire downstream computational graph to track grads,
+        # resolving the "None of the inputs have requires_grad=True" warning and 
+        # avoiding CheckpointError mismatches during gradient checkpointing recomputation.
+        if self.training:
+            input_audio_embeds.requires_grad_(True)
+
         if audio_attention_mask is not None:
             audio_attention_mask = audio_attention_mask.to(device=_device, non_blocking=True)
 
