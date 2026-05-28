@@ -105,16 +105,28 @@ class OmniPhiS2ST(nn.Module):
     """
 
     PHI4_MODEL_ID = "microsoft/Phi-4-multimodal-instruct"
+    PHI4_HUB_ID   = "microsoft/Phi-4-multimodal-instruct"
 
     def __init__(self, phi4_model_id: str = PHI4_MODEL_ID, device: str = "cuda"):
         super().__init__()
         self.device = device
 
         # ── Source & LLM Block ──────────────────────────────────────────────
-        print("[OmniPhiS2ST] Loading Phi-4 AutoProcessor...")
-        self.processor = AutoProcessor.from_pretrained(
-            phi4_model_id, trust_remote_code=True
-        )
+        # Processor: try the given path first; fall back to hub if broken.
+        # Checkpoints saved by OmniPhiTrainer may omit preprocessor_config.json
+        # due to a Phi4MMProcessor bug — loading from the hub gives the exact
+        # same (never-fine-tuned) weights and config.
+        print("[OmniPhiS2ST] Loading AutoProcessor...")
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                phi4_model_id, trust_remote_code=True
+            )
+        except (TypeError, OSError) as e:
+            print(f"[OmniPhiS2ST] Processor load failed ({e.__class__.__name__}). "
+                  f"Falling back to hub: {self.PHI4_HUB_ID}")
+            self.processor = AutoProcessor.from_pretrained(
+                self.PHI4_HUB_ID, trust_remote_code=True
+            )
 
         print("[OmniPhiS2ST] Loading Phi-4 model...")
         # Prefer FlashAttention-2 on A100 (much faster); fall back to SDPA if not installed

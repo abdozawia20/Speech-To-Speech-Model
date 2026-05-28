@@ -46,25 +46,56 @@ class OmniPhiDataset(Dataset):
             ANSWER_SUFFIX, return_tensors="pt"
         ).input_ids  # [1, suffix_len] — computed once
 
-        print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} ...")
-        with open(jsonl_path, "rb") as f:
-            offset = 0
-            for line in f:
-                if line.strip():
-                    self.offsets.append(offset)
-                offset += len(line)
-        print(f"[OmniPhiDataset] Scanned {len(self.offsets)} records.")
+        # Fast path: if every cache file already exists we can skip the
+        # JSONL byte-offset scan entirely.  The offsets are only needed by
+        # _compute_and_cache(), which is never called when cache is complete.
+        # We count contiguous {0..N-1}.pt files and use that as our length.
+        cached_count = 0
+        while (self.cache_dir / f"{cached_count}.pt").exists():
+            cached_count += 1
+
+        if cached_count > 0:
+            # Cheap sentinel: store zeros just to establish __len__.
+            # Actual byte offsets are irrelevant because _build_cache will
+            # find no missing files and return immediately.
+            self.offsets = [0] * cached_count
+            print(f"[OmniPhiDataset] Cache hit — {cached_count} samples found in "
+                  f"{self.cache_dir}. Skipping JSONL scan.")
+        else:
+            # Cache is empty (or partially built): scan the JSONL to build offsets
+            # so _compute_and_cache() can seek to each record.
+            print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} ...")
+            with open(jsonl_path, "rb") as f:
+                offset = 0
+                for line in f:
+                    if line.strip():
+                        self.offsets.append(offset)
+                    offset += len(line)
+            print(f"[OmniPhiDataset] Scanned {len(self.offsets)} records.")
 
         # Pre-warm cache on construction (single-threaded, runs once)
         self._build_cache()
 
     def _build_cache(self):
-        """Run processor once per sample and persist tensors to disk."""
+        """Run processor once per sample and persist tensors to disk.
+
+        When the fast path in __init__ detected a fully-populated cache,
+        self.offsets contains sentinel zeros and missing will be empty,
+        so this returns immediately without touching the JSONL.
+        """
         missing = [i for i in range(len(self.offsets))
                    if not (self.cache_dir / f"{i}.pt").exists()]
         if not missing:
             print(f"[OmniPhiDataset] Cache already complete ({len(self.offsets)} samples). Skipping.")
             return
+
+        # Partial cache: offsets must be real (not sentinels) at this point
+        # because _compute_and_cache() will seek into the JSONL.
+        if any(o == 0 and i > 0 for i, o in enumerate(self.offsets)):
+            raise RuntimeError(
+                "[OmniPhiDataset] Cache is incomplete but byte offsets are sentinels. "
+                "Delete the cache directory and restart to rebuild from the JSONL."
+            )
 
         print(f"[OmniPhiDataset] Building feature cache for {len(missing)} samples "
               f"(this runs once — future epochs will load from disk)...")

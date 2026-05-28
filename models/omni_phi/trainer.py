@@ -70,6 +70,18 @@ class OmniPhiTrainer(Trainer):
                     processor.tokenizer.save_pretrained(output_dir)
                     print("[OmniPhiTrainer] Saved tokenizer (processor.save_pretrained skipped due to Phi4MM bug).")
 
+        # Write a complete preprocessor_config.json from the hub so that
+        # AutoProcessor.from_pretrained(output_dir) works on the next load
+        # without needing the hub-fallback in model.py.
+        try:
+            from transformers import AutoProcessor as _AP
+            PHI4_HUB_ID = "microsoft/Phi-4-multimodal-instruct"
+            _AP.from_pretrained(PHI4_HUB_ID, trust_remote_code=True).save_pretrained(output_dir)
+            print("[OmniPhiTrainer] Wrote complete preprocessor_config.json from hub to checkpoint.")
+        except Exception as hub_err:
+            print(f"[OmniPhiTrainer] Could not write hub processor to checkpoint ({hub_err}). "
+                  "model.py fallback will handle future loads.")
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """
         Override mid-training checkpoint saving to also use safe_serialization=False.
