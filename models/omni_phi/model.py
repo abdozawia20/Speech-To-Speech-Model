@@ -3,7 +3,6 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from transformers import LogitsProcessor
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 # Enable TF32 on A100 for free ~10-20% speedup on matrix multiplications
@@ -61,37 +60,6 @@ BANDWIDTH     = 1.5
 TOKEN_OFFSET  = 100_000
 NUM_CODEBOOKS = 2     # at 1.5 kbps
 CODEBOOK_SIZE = 1024  # EnCodec codebook entries per codebook at 1.5 kbps
-
-class EnCodecOnlyLogitsProcessor(LogitsProcessor):
-    """
-    Constrains token generation to only the EnCodec codebook range:
-        [TOKEN_OFFSET, TOKEN_OFFSET + CODEBOOK_SIZE - 1]  (i.e. 100000–101023)
-
-    Why: Phi-4 has a 100k+ token vocabulary. After partial LoRA fine-tuning the
-    probability mass for the rare EnCodec tokens is still very low compared to
-    common text/punctuation tokens. With greedy decoding (`do_sample=False`) the
-    model overwhelmingly picks text tokens and produces silence.
-
-    This processor zeroes out all logits outside the EnCodec range BEFORE sampling,
-    so the model is forced to choose an EnCodec token at every step. The relative
-    ordering within the EnCodec range is preserved, so the model's learned
-    preferences among the 1024 codes are still honoured.
-    """
-    def __init__(self, token_offset: int = TOKEN_OFFSET, codebook_size: int = CODEBOOK_SIZE,
-                 eos_token_id: int = None):
-        self.lo  = token_offset
-        self.hi  = token_offset + codebook_size  # exclusive upper bound
-        self.eos = eos_token_id
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        # Build a -inf mask for the entire vocabulary
-        mask = torch.full_like(scores, float("-inf"))
-        # Allow the EnCodec range
-        mask[:, self.lo : self.hi] = scores[:, self.lo : self.hi]
-        # Always allow EOS so the model can terminate naturally
-        if self.eos is not None:
-            mask[:, self.eos] = scores[:, self.eos]
-        return mask
 
 
 class OmniPhiS2ST(nn.Module):
@@ -302,25 +270,19 @@ class OmniPhiS2ST(nn.Module):
         torch.cuda.empty_cache()  # flush any leftover allocations before generation
         print(f"[generate_speech] Generating up to {max_new_tokens} tokens on {self.device}...")
 
-        # Force the model to only generate tokens in [TOKEN_OFFSET, TOKEN_OFFSET+CODEBOOK_SIZE).
-        # Without this, greedy decoding overwhelmingly picks common text/punctuation tokens
-        # (which have much higher pre-training probability) and produces silence.
-        encodec_processor = EnCodecOnlyLogitsProcessor(
-            token_offset=TOKEN_OFFSET,
-            codebook_size=CODEBOOK_SIZE,
-            eos_token_id=eos_id,
-        )
-
+        # ── Step 2: Auto-regressively generate target token IDs ─────────────
         generated_ids = self.phi4.generate(
             **inputs,
-            input_mode=2,                        # speech mode
+            input_mode=2,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_id,
-            do_sample=True,                      # temperature sampling: gives rare EnCodec
-            temperature=0.8,                     # tokens a fair chance to be selected
-            top_p=0.95,
-            logits_processor=[encodec_processor],# enforce EnCodec-only output
-            num_logits_to_keep=1,                # only keep last token logits (saves memory)
+            do_sample=True,
+            temperature=0.6,
+            top_p=0.90,
+            repetition_penalty=1.3,
+            # LogitsProcessorList removed — causes num_logits_to_keep=None crash
+            # in transformers 4.57.3. The token filter at Step 3 below discards
+            # any stray text tokens the model might generate.
         )
         print(f"[generate_speech] Generation done. Total ids shape: {generated_ids.shape}")
 
