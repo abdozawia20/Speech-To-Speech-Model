@@ -78,7 +78,7 @@ class OmniPhiTrainer(Trainer):
         self._save_processor(output_dir)
 
     # ── Mid-training checkpoint (checkpoint-NNN/) ─────────────────────────────
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial, **kwargs):
         """
         Saves a full resumable checkpoint to output_dir/checkpoint-{global_step}/.
 
@@ -88,8 +88,11 @@ class OmniPhiTrainer(Trainer):
           • scheduler.pt         — LR scheduler     │ written by
           • rng_state*.pth       — RNG state        │ super()._save_checkpoint
           • trainer_state.json   — step/epoch/loss  ┘
+
+        **kwargs absorbs any signature changes across transformers versions
+        (e.g. `metrics` was removed in 4.57.x).
         """
-        super()._save_checkpoint(model, trial, metrics=metrics)
+        super()._save_checkpoint(model, trial, **kwargs)
 
     # ── Processor / tokenizer helper ──────────────────────────────────────────
     def _save_processor(self, output_dir: str):
