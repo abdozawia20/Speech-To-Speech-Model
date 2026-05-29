@@ -49,6 +49,43 @@ try:
 except Exception:
     pass
 
+# Monkey-patch Phi-4's forward() to guard against num_logits_to_keep=None.
+#
+# Root cause: transformers 4.57.x passes num_logits_to_keep=None through the
+#   generate() → prepare_inputs_for_generation() → forward() pipeline.
+# Phi-4's cached modeling_phi4mm.py then executes:
+#   hidden_states[:, -num_logits_to_keep:, :]
+# which crashes with "bad operand type for unary -: 'NoneType'" because Python
+# cannot negate None.  The inner forward signature defaults to 0 (= "keep all
+# logits"), so mapping None → 0 restores that safe default without changing
+# any model outputs.
+try:
+    from transformers.utils import is_flash_attn_2_available  # noqa: F401 – confirms transformers is importable
+    import transformers.dynamic_module_utils as _dmu
+
+    # The class lives in the trust_remote_code cached module; find it by walking
+    # all loaded modules that expose Phi4MMForCausalLM.
+    import sys as _sys
+    for _mod in list(_sys.modules.values()):
+        _cls = getattr(_mod, "Phi4MMForCausalLM", None)
+        if _cls is not None and hasattr(_cls, "forward"):
+            _orig_phi4_forward = _cls.forward
+
+            def _patched_phi4_forward(self, *args, num_logits_to_keep=0, **kwargs):
+                # Coerce None → 0 so hidden_states[:, -0:, :] == hidden_states[:, :, :]
+                if num_logits_to_keep is None:
+                    num_logits_to_keep = 0
+                return _orig_phi4_forward(self, *args, num_logits_to_keep=num_logits_to_keep, **kwargs)
+
+            _cls.forward = _patched_phi4_forward
+            print(f"[model.py] Patched Phi4MMForCausalLM.forward for num_logits_to_keep=None fix.")
+            break
+except Exception as _e:
+    # Non-fatal: if the class isn't loaded yet the patch will be applied lazily
+    # via the generate_speech wrapper below.
+    pass
+
+
 # Add project root to sys.path so we can import encoders from the root directory
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if project_root not in sys.path:
@@ -248,6 +285,20 @@ class OmniPhiS2ST(nn.Module):
         # It will be moved to device only for the final decode step.
         self.vqgan.model.eval().cpu()
 
+        # ── Lazy forward-patch: ensure num_logits_to_keep=None is handled ────
+        # The trust_remote_code class may not be in sys.modules at import time,
+        # so we re-check here after the model is definitely loaded.
+        _phi4_cls = type(self.phi4)
+        if not getattr(_phi4_cls, "_num_logits_patched", False):
+            _orig_fwd = _phi4_cls.forward
+            def _safe_fwd(self_inner, *args, num_logits_to_keep=0, **kwargs):
+                if num_logits_to_keep is None:
+                    num_logits_to_keep = 0
+                return _orig_fwd(self_inner, *args, num_logits_to_keep=num_logits_to_keep, **kwargs)
+            _phi4_cls.forward = _safe_fwd
+            _phi4_cls._num_logits_patched = True
+            print(f"[generate_speech] Patched {_phi4_cls.__name__}.forward for num_logits_to_keep=None.")
+
         # ── Step 1: Build prompt and process source audio ───────────────────
         user_message = {
             "role": "user",
@@ -270,7 +321,7 @@ class OmniPhiS2ST(nn.Module):
         torch.cuda.empty_cache()  # flush any leftover allocations before generation
         print(f"[generate_speech] Generating up to {max_new_tokens} tokens on {self.device}...")
 
-        # ── Step 2: Auto-regressively generate target token IDs ─────────────
+
         generated_ids = self.phi4.generate(
             **inputs,
             input_mode=2,
