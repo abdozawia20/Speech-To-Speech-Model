@@ -21,20 +21,14 @@ sys.path.append(project_root)
 # ---------------------------------------------------------------------------
 NUM_PROC = 1
 DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets")
-
-# Supported languages for CVSS (to English)
 CVSS_LANGS = ['ar', 'ca', 'cy', 'de', 'el', 'es', 'et', 'fa', 'fr', 'id', 'it', 'ja', 'lv', 'mn', 'nl', 'pt', 'ru', 'sl', 'sv', 'tr', 'zh']
 
 # ---------------------------------------------------------------------------
 # SEAMLESS-ALIGN LANGUAGE CONFIGURATION
 # ---------------------------------------------------------------------------
-# All 35 SeamlessAlign S2S language pairs (all paired with English).
-# Config names follow the convention: sorted alphabetically by 2-letter code,
-# e.g. ('de', 'en') → 'deA-enA', ('en', 'es') → 'enA-esA'.
-# We generate the mapping programmatically so it's easy to extend.
 _SEAMLESS_S2S_LANGS = [
-    'ar', 'bg', 'ca', 'cs', 'cy', 'da', 'de', 'el',  # before 'e'
-    'es', 'et', 'fi', 'fr', 'ga', 'gl', 'hr', 'hu',  # e onwards
+    'ar', 'bg', 'ca', 'cs', 'cy', 'da', 'de', 'el',
+    'es', 'et', 'fi', 'fr', 'ga', 'gl', 'hr', 'hu',
     'hy', 'id', 'it', 'ja', 'ko', 'lt', 'lv', 'mk',
     'ml', 'mt', 'nl', 'pl', 'pt', 'ro', 'ru', 'sk',
     'sl', 'sr', 'sv', 'sw', 'ta', 'te', 'th', 'tr',
@@ -54,10 +48,7 @@ def _build_pair_mapping(lang_list):
         mapping[key] = cfg
     return mapping
 
-# Full set supported by seamless-align (35 non-English langs × en)
 SEAMLESS_PAIR_MAPPING = _build_pair_mapping(_SEAMLESS_S2S_LANGS)
-
-# Only the 5 pairs available in seamless-align-EXPRESSIVE
 _SEAMLESS_EXPRESSIVE_LANGS = ['de', 'es', 'fr', 'it', 'zh']
 SEAMLESS_EXPRESSIVE_PAIR_MAPPING = _build_pair_mapping(_SEAMLESS_EXPRESSIVE_LANGS)
 
@@ -68,15 +59,9 @@ LID_THRESHOLD   = 0.75  # Whisper language probability threshold
 LID_BATCH_SIZE  = 64    # samples per LID batch — feed the thread pool generously
 
 # Force Whisper LID to run on CPU regardless of GPU availability.
-# Default True: the GPU is typically occupied by the main speech model
-# (Phi-4, SpeechT5, etc.) and loading Whisper onto the same GPU causes VRAM OOM.
-# Set to False only if you have a dedicated second GPU with free VRAM.
 WHISPER_FORCE_CPU = False
 
-# Threading: CTranslate2 releases the Python GIL during matrix ops, so
-# ThreadPoolExecutor gives true parallelism for Whisper inference.
-# num_workers on the model = max concurrent compute streams in CTranslate2.
-# Keep cpu_threads * LID_NUM_THREADS <= total logical cores to avoid thrashing.
+# Multi Threading
 LID_NUM_THREADS = min(8, os.cpu_count() or 4)
 
 # ---------------------------------------------------------------------------
@@ -223,9 +208,6 @@ def _lid_single(audio_field, expected_lang, threshold):
         model = _get_whisper_model()
         if model is None:
             return True   # conservative: keep when model unavailable
-        # transcribe() returns (segments_generator, info).
-        # info (language detection) is computed eagerly; segments are lazy —
-        # we deliberately ignore them to avoid running the full decoder.
         _, info = model.transcribe(arr, beam_size=1, task="transcribe",
                                    without_timestamps=True)
         return (info.language == expected_lang and
@@ -238,15 +220,6 @@ def check_language_batch(batch, expected_lang, threshold=LID_THRESHOLD):
     """
     Detects language using Whisper for every clip in the batch.
     Compatible with datasets.map(batched=True).
-
-    Concurrency model
-    -----------------
-    ThreadPoolExecutor submits one _lid_single() call per clip.
-    CTranslate2 releases the GIL during its C++ compute kernels, so
-    LID_NUM_THREADS clips run in parallel even inside a single Python
-    process.  The WhisperModel is shared safely across threads because
-    CTranslate2's internal num_workers serialises concurrent requests
-    into its own thread pool — no additional locking needed here.
     """
     if _get_whisper_model() is None:
         return {"is_valid_lang": [True] * len(batch["audio"])}
@@ -269,7 +242,7 @@ def quality_filter_batch(batch,
                           max_dur=MAX_DURATION_S):
     """
     Fast pre-filter: removes silent/corrupt/too-short/too-long clips
-    WITHOUT running Whisper.  Intended as a first pass before LID.
+    WITHOUT running Whisper. Intended as a first pass before LID.
     """
     keep = []
     for audio_field in batch["audio"]:
@@ -301,9 +274,6 @@ def verify_paired_language(src_ds, tgt_ds,
     Runs LID on both sides of a parallel corpus and returns only pairs
     where BOTH src and tgt pass their respective language checks.
 
-    This is the correct approach for web-scraped data: a pair is only
-    valid if both audio segments truly contain the expected language.
-
     Args:
         src_ds:   HF Dataset with 'id' and 'audio' columns (source side)
         tgt_ds:   HF Dataset with 'id' and 'audio' columns (target side)
@@ -321,8 +291,6 @@ def verify_paired_language(src_ds, tgt_ds,
     fn_kwargs_tgt = {"expected_lang": tgt_lang, "threshold": threshold}
 
     # num_proc=1 is intentional: threading happens *inside* check_language_batch
-    # via ThreadPoolExecutor.  Mixing HF multiprocessing (spawn) with CTranslate2
-    # internal threads causes BLAS/OpenMP conflicts and is slower in practice.
     src_mask = src_ds.map(
         check_language_batch, batched=True, batch_size=LID_BATCH_SIZE,
         num_proc=1, fn_kwargs=fn_kwargs_src,
@@ -384,12 +352,7 @@ def _get_seamless_config(lang, context_langs=None, expressive=False):
         expressive:    if True, use the 5-pair expressive variant;
                        if False (default), use the full 35-pair dataset.
     """
-    pair_mapping   = SEAMLESS_EXPRESSIVE_PAIR_MAPPING if expressive \
-                     else SEAMLESS_PAIR_MAPPING
-    # pair_mapping keys are tuples: ('de', 'en'), ('en', 'fr'), etc.
-    # Unpack both language codes from each key tuple directly.
-    # (The previous set-comprehension over pair_mapping[k][0][:2] was wrong:
-    # pair_mapping[k] is a string like 'deA-enA', so [0] gives char 'd', not 'de'.)
+    pair_mapping   = SEAMLESS_EXPRESSIVE_PAIR_MAPPING if expressive else SEAMLESS_PAIR_MAPPING
     supported_langs = {code for key in pair_mapping for code in key}
 
     lang_code = lang[:2]
@@ -480,11 +443,7 @@ def _process_seamless_dataset_paired(ds, config_name,
                                       start_idx=0, num_samples=None):
     """
     Extracts BOTH src and tgt sides from a raw SeamlessAlign shard as
-    **lazy** (index-mapped) HF Datasets.  Critically, this function does
-    NOT materialise any audio: it only reads the lightweight __key__ string
-    column to build index maps, then returns two ds.select() views of the
-    original Arrow file.  The actual MP3 bytes are never decoded or copied
-    until _finalize_seamless_side() is called after all filtering is done.
+    **lazy** (index-mapped) HF Datasets.
 
     Returns:
         (src_raw, tgt_raw, src_lang, tgt_lang)
@@ -667,26 +626,6 @@ def _lid_filter_indices(ds, expected_lang, audio_col='audio',
     Runs Whisper detect_language on each row and returns a list of valid
     row indices where the detected language matches expected_lang.
 
-    Memory strategy — why one row at a time
-    ----------------------------------------
-    The previous batch-slice approach (ds[start:end]) materialised an entire
-    batch of decoded audio arrays into Python RAM simultaneously.  With a GPU
-    holding the Whisper model (~150 MB parameters + CUDA activations), the
-    combined pressure caused the Jupyter kernel to be OOM-killed.
-
-    We now fetch ONE row at a time (ds[i]), decode it, trim to lid_secs,
-    call detect_language, then immediately drop the reference.  This keeps
-    peak RAM at:
-        1 decoded clip (≤5 s × 16kHz × 4 bytes ≈ 320 KB)
-      + Whisper CUDA tensors (encoder forward pass activations)
-    instead of batch_size clips all alive simultaneously.
-
-    detect_language vs transcribe
-    ------------------------------
-    Uses model.detect_language() — encoder + language-head only.
-    No decoder, no beam search → ~5-10× faster per sample than transcribe().
-    Language identity is reliably detectable from the first 5 seconds of audio.
-
     Does NOT write any Arrow cache file.
     """
     model = _get_whisper_model()
@@ -746,25 +685,11 @@ def _crosslang_duplicate_filter_indices(src_ds, tgt_ds,
     Rejects pairs where src and tgt audio are the same or nearly identical
     recording.  This is a common artifact in web-mined parallel corpora
     (e.g. SeamlessAlign) where the mining pipeline assigns the same speech
-    file to both sides of a pair — sometimes at a different volume, with a
-    small time offset, or with a slight speed difference (e.g. different
-    MP3 encoding, or trimmed differently).
+    file to both sides of a pair.
 
     Two complementary checks are applied:
-
     Check 1 — Lag-0 waveform cosine similarity (fast)
-        After RMS-normalising both clips: cos_sim = mean(src_norm * tgt_norm).
-        Catches identical recordings independent of volume.
-        Limitation: a 50-100 ms time offset between src and tgt drops this
-        below 0.85 even for the same recording.
-
     Check 2 — Magnitude spectrum cosine similarity (shift/speed-invariant)
-        Compute |FFT(src_norm)| and |FFT(tgt_norm)|, L2-normalise, dot product.
-        The FFT magnitude discards all phase information → completely
-        time-shift-invariant.  Also near-invariant to small speed changes
-        (e.g. ~3 % speed difference from different segment boundaries).
-        Higher threshold (0.92) used because same-speaker cross-language pairs
-        share spectral envelope characteristics.
 
     A pair is rejected if EITHER check fires.
 
@@ -779,15 +704,11 @@ def _crosslang_duplicate_filter_indices(src_ds, tgt_ds,
     Different content, same speaker        | ~0.00-0.15 | ~0.50-0.65
     Genuine translation pair               | ~0.00-0.05 | ~0.30-0.55
 
-    Threshold set conservatively at 0.82 (below the lowest observed duplicate
-    at 0.897, well above the highest observed legitimate pair at 0.563).
-    Prefer dropping borderline-clean pairs over keeping polluted ones.
-
-    Returns a list of row indices to KEEP.
+    Returns a list of row indices to KEEP to ensure the cleanest dataset.
     """
     check_samples     = int(check_sr * max_check_secs)
     downsample_factor = max(1, 16000 // check_sr)
-    min_samples       = int(check_sr * 0.5)   # need >= 0.5 s to decide
+    min_samples       = int(check_sr * 0.5)
 
     valid      = []
     n          = min(len(src_ds), len(tgt_ds))
@@ -838,10 +759,6 @@ def _crosslang_duplicate_filter_indices(src_ds, tgt_ds,
                     continue
 
                 # ── Check 2: magnitude spectrum similarity ────────────────
-                # |FFT| discards phase → completely time-shift-invariant.
-                # Catches time-offset / speed-changed duplicates that slip
-                # past the lag-0 check (e.g. src=4.25 s, tgt=4.14 s gives
-                # ~3 %% speed diff → lag-0 sim drops to ~0.6 but spec_sim ~ 0.95).
                 src_spec = np.abs(np.fft.rfft(src_norm))
                 tgt_spec = np.abs(np.fft.rfft(tgt_norm))
                 src_spec = src_spec / (np.linalg.norm(src_spec) + 1e-8)
@@ -865,14 +782,10 @@ def _crosslang_duplicate_filter_indices(src_ds, tgt_ds,
 def _finalize_seamless_side(raw_ds, lang_code, prefix, audio_col='audio'):
     """
     Performs the final column rename/add on an already-filtered (small) dataset.
-    This is the ONLY step in the SeamlessAlign pipeline that writes an Arrow
-    cache file.  Because it runs after all quality + LID filtering, only the
-    surviving pairs are materialised — typically a fraction of the original shard.
 
     Input columns:  [audio_col, '__key__', '__url__', ...]
     Output columns: ['id', 'audio', 'language', 'gender', 'transcription']
     """
-    # Pre-compute IDs from __key__ strings only — no audio decoded here
     keys = raw_ds['__key__']
     ids  = [
         generate_id_from_string(k.replace(prefix, '').replace('/', ''))
@@ -910,24 +823,10 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
 
     Key filtering strategy for web-scraped data
     -------------------------------------------
-    Unlike FLEURS, SeamlessAlign is mined from the open web with SONAR
-    embeddings.  Language labels come from the __key__ prefix (src/ vs tgt/)
-    — they are NOT ground-truth.  Five filtering layers are applied:
-
     1. Quality pre-filter  — duration gates + silence detection (cheap, CPU)
-    2. Cross-lingual dedup — spectral fingerprint check that detects pairs where
-                             src and tgt are the same recording (common artefact
-                             in web-mined corpora, same or different volume,
-                             time-shifted, or slightly speed-changed).
-    3. Target-side LID     — Whisper detect_language on the TARGET (non-English)
-                             side only.  Catches the most common contamination:
-                             English audio mislabeled as German (or another lang).
-                             Enabled by default; disable with use_tgt_lid=False.
-                             Cost: N Whisper runs (vs 2N for full paired LID).
-    4. Full paired LID     — Whisper detect_language on BOTH sides.  Catches
-                             src contamination (e.g. German audio on the EN side)
-                             in addition to tgt contamination.  Optional; enable
-                             with use_paired_lid=True for maximum cleanliness.
+    2. Cross-lingual dedup — spectral fingerprint check to detect duplicates
+    3. Target-side LID     — Whisper detect_language on the TARGET (non-English) side only. For detecting misslabeled audios.
+    4. Full paired LID     — Whisper detect_language on BOTH sides. For detecting src contamination (e.g. German audio on the EN side) in addition to tgt contamination.
     5. Common-ID intersection in load_data() — final cross-language alignment.
 
     Args:
@@ -950,7 +849,6 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
     )
 
     # Group language pairs so we load each bilingual shard only once.
-    # pairs_to_load: config_name → set of lang_codes we need from it
     pairs_to_load: dict[str, set] = {}
     for lang_code in lang_list:
         pair_cfg, is_pair = _get_seamless_config(
@@ -984,8 +882,6 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
         print(f"[SeamlessAlign] {pair_cfg}: {n_initial} candidate pairs")
 
         # ── 1. Quality filter (always runs, even without LID) ────────────
-        # Iterates audio in mini-batches.  Peak RAM = batch_size × avg MP3.
-        # No Arrow cache file is written at this step.
         print(f"  Quality filter (duration + silence)...")
         src_q = set(_quality_filter_indices(src_raw))
         tgt_q = set(_quality_filter_indices(tgt_raw))
@@ -1001,10 +897,6 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
         tgt_raw = tgt_raw.select(both_q)
 
         # ── 2. Cross-lingual duplicate detection ──────────────────────────
-        # Detects pairs where src ≈ tgt (same recording on both sides,
-        # sometimes at a different volume).  This is a known SeamlessAlign
-        # artefact from the web-mining pipeline.  LID cannot catch it because
-        # both sides may be correctly labelled as the same language.
         n_after_q = len(src_raw)
         print(f"  Cross-lingual dedup (waveform≥0.85, spectrum≥0.82)...")
         valid_dedup = _crosslang_duplicate_filter_indices(src_raw, tgt_raw)
@@ -1017,17 +909,6 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
             continue
 
         # ── 3. Non-English-side LID ───────────────────────────────────────────
-        # SeamlessAlign is always language↔English (English is the SONAR pivot).
-        # Contamination = English audio appearing in the NON-English slot (e.g.
-        # English speaker in the German/src slot, mislabeled as German).
-        #
-        # Previous bug: LID ran on tgt (English) side — checked "is English
-        # actually English?" → useless.  Now runs on the NON-English side:
-        # "is German actually German?" → catches en→en contamination.
-        #
-        # Uses detect_language (encoder-only) + 5 s audio trim on CPU int8.
-        # WHISPER_FORCE_CPU=True by default to avoid VRAM OOM alongside the
-        # main speech model.  CPU int8 + 100 samples ≈ 10-30 s (fast enough).
         if use_tgt_lid and not use_paired_lid:
             n_after_dedup = len(src_raw)
 
@@ -1048,9 +929,6 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
                 )
             print(f"  Non-EN-side LID (checking '{lid_lang}' is not English)...")
             valid_l = _lid_filter_indices(lid_raw, lid_lang)
-            # Apply the SAME position indices to BOTH sides to keep alignment.
-            # lid_raw[i] ↔ other_raw[i] because alignment has been maintained
-            # throughout quality filter and dedup using position-based selects.
             src_raw = src_raw.select(valid_l)
             tgt_raw = tgt_raw.select(valid_l)
             print(f"  Non-EN LID: {len(valid_l)}/{n_after_dedup} pairs passed")
@@ -1061,12 +939,8 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
 
 
         # ── 4. Full paired LID (optional — checks BOTH sides) ─────────────
-        # Run this if you also want to catch source-side contamination
-        # (e.g. German audio mislabeled as English on the src side).
-        # Superset of tgt-only LID; runs 2N Whisper calls instead of N.
         if use_paired_lid:
             n_after_dedup = len(src_raw)
-            # Rough: detect_language ≈ 0.1-0.3s/sample on CPU (5-10x faster than transcribe)
             est_min = (n_after_dedup * 2) / 60
             if est_min > 10:
                 print(
@@ -1084,14 +958,10 @@ def _load_seamless_data(split, lang_list, start_idx, num_samples,
                 print(f"  [warn] No pairs survived paired LID for {pair_cfg}.")
                 continue
 
-            # Lazy indexed views of LID-filtered pairs
             src_raw = src_raw.select(both_l)
             tgt_raw = tgt_raw.select(both_l)
 
         # ── 4. Finalise: add metadata + materialise (small dataset only) ──
-        # This is the ONLY Arrow write in the pipeline.  By this point the
-        # dataset has already been filtered, so only the surviving pairs
-        # (~num_samples rows) are written to disk.
         n_final = len(src_raw)
         print(f"  Finalising {n_final} pairs (writing Arrow cache)...")
         src_ds = _finalize_seamless_side(src_raw, src_lang, 'src/')
@@ -1189,16 +1059,9 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None,
         seamless_expressive:  use seamless-align-expressive (5 pairs) instead of
                               the full seamless-align (35 pairs).
         seamless_tgt_lid:     run Whisper LID on the TARGET (non-source) language
-                              side of each SeamlessAlign pair.  Catches same-
-                              language different-speaker contamination (e.g. an
-                              English speaker appearing in the German slot).
-                              Uses detect_language (encoder-only, 5-10x faster
-                              than transcribe) on first 5s of audio.
-                              Default True.  Cost: N calls per pair.
+                              side of each SeamlessAlign pair.
         seamless_paired_lid:  run paired LID on BOTH sides of each SeamlessAlign
-                              pair.  Superset of seamless_tgt_lid; also catches
-                              source-side contamination.  Default False.
-                              Cost: 2N calls per pair.
+                              pair.
         start_idx, num_samples, lang, split, dataset, encoding: as before.
     """
     if dataset is None:
@@ -1211,24 +1074,18 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None,
             final_datasets[l].append(ds)
 
     if 'seamless_align' in dataset:
-        # 2× buffer: quality filter rejects ~10-20% of web data, so
-        # fetching 2× num_samples candidate pairs reliably yields enough
-        # clean pairs after filtering without pulling in huge amounts of
-        # data.  Audio is never materialised during quality filter / LID
-        # (the new lazy pipeline), so a larger multiplier is not needed.
         sa_limit = (num_samples * 2) if num_samples is not None else None
 
         # Speed guidance for LID
         active_lid = seamless_paired_lid or seamless_tgt_lid
         if active_lid and num_samples is not None and num_samples > 1000:
-            n_calls = num_samples * (4 if seamless_paired_lid else 2)  # 2× buffer
-            est_h = n_calls / 3600  # rough: 1s/call on CPU; GPU is ~100× faster
+            n_calls = num_samples * (4 if seamless_paired_lid else 2)
+            est_h = n_calls / 3600
             lid_mode = 'paired' if seamless_paired_lid else 'tgt-only'
             print(
-                f"[SeamlessAlign] ⚠️  {lid_mode} LID with num_samples={num_samples}: "
+                f"[SeamlessAlign] {lid_mode} LID with num_samples={num_samples}: "
                 f"~{n_calls} Whisper detect_language calls (~{est_h:.1f}h CPU / "
                 f"~{est_h*0.01:.1f}h GPU).\n"
-                f"  → detect_language is 5-10x faster than transcribe. "
                 f"GPU strongly recommended for large loads."
             )
 
@@ -1338,7 +1195,7 @@ def load_data(start_idx=0, num_samples=10000, encoding=None, lang=None,
     return datasets
 
 # ---------------------------------------------------------------------------
-# LEGACY / STANDALONE HELPERS
+# STANDALONE HELPERS
 # ---------------------------------------------------------------------------
 
 def verify_dataset_language(ds, target_lang,
