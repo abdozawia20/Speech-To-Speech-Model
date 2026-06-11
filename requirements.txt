@@ -22,3 +22,10 @@ jiwer
 torchvision
 backoff
 ipywidgets
+evaluate
+sacrebleu
+rouge-score
+pytorch-lightning==2.6.1
+entmax
+jsonargparse
+protobuf==5.28.3

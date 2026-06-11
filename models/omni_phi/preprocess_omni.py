@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="seamless_align", choices=["fleurs", "seamless_align"],
                         help="Dataset to load ('fleurs' or 'seamless_align')")
     parser.add_argument("--lang_src", type=str, default="en", help="Source language code (default: en)")
-    parser.add_argument("--lang_tgt", type=str, default="de", help="Target language code (default: de)")
+    parser.add_argument("--lang_tgt", type=str, default="fr", help="Target language code (default: de)")
     parser.add_argument("--split", type=str, default="train", help="Dataset split to preprocess (default: train)")
     parser.add_argument("--num_samples", type=int, default=15000, help="Maximum number of samples to load")
     parser.add_argument("--bandwidth", type=float, default=1.5, help="EnCodec bandwidth in kbps (default: 1.5 for 2 codebooks)")
@@ -95,6 +95,7 @@ def main():
         lang=[args.lang_src, args.lang_tgt],
         split=args.split,
         num_samples=args.num_samples,
+        seamless_expressive=True
     )
     
     src_ds = datasets.get(args.lang_src)

@@ -112,9 +112,31 @@ class OmniPhiS2ST(nn.Module):
     PHI4_MODEL_ID = "microsoft/Phi-4-multimodal-instruct"
     PHI4_HUB_ID   = "microsoft/Phi-4-multimodal-instruct"
 
-    def __init__(self, phi4_model_id: str = PHI4_MODEL_ID, device: str = "cuda"):
+    def __init__(self, phi4_model_id: str = PHI4_MODEL_ID, device: str = "cuda",
+                 is_finetuned: bool | None = None):
+        """
+        Args:
+            phi4_model_id:  Hub ID or local path to load the Phi-4 backbone from.
+            device:         'cuda' or 'cpu'.
+            is_finetuned:   If True, the checkpoint already contains trained LoRA
+                            weights merged into the backbone — skip set_lora_adapter
+                            so we don't overwrite them with a fresh random adapter.
+                            If False (default for hub IDs), apply set_lora_adapter
+                            as usual for training.
+                            If None (default), auto-detected: True when phi4_model_id
+                            is a local directory that is NOT the hub model name.
+        """
         super().__init__()
         self.device = device
+
+        # ── Auto-detect whether we are loading a fine-tuned checkpoint ───────
+        if is_finetuned is None:
+            _is_local = os.path.isdir(phi4_model_id)
+            _is_hub   = (phi4_model_id == self.PHI4_MODEL_ID)
+            is_finetuned = _is_local and not _is_hub
+            if is_finetuned:
+                print(f"[OmniPhiS2ST] Fine-tuned checkpoint detected at '{phi4_model_id}'. "
+                      "Skipping set_lora_adapter to preserve trained weights.")
 
         # ── Source & LLM Block ──────────────────────────────────────────────
         # Processor: try the given path first; fall back to hub if broken.
@@ -160,10 +182,16 @@ class OmniPhiS2ST(nn.Module):
                 trust_remote_code=True,
             ).to(device)
 
-        # Apply LoRA: freezes vision/text backbone; trains only speech adapter
-        self.phi4.set_lora_adapter("speech")
-        self.phi4.enable_input_require_grads()
-        print("[OmniPhiS2ST] LoRA speech adapter applied. Non-audio layers frozen.")
+        if not is_finetuned:
+            # Training path: apply a fresh LoRA speech adapter and freeze all other layers.
+            # Do NOT do this when loading a fine-tuned checkpoint — the checkpoint
+            # already contains the trained LoRA weights baked in, and calling
+            # set_lora_adapter here would overwrite them with a random initialisation.
+            self.phi4.set_lora_adapter("speech")
+            self.phi4.enable_input_require_grads()
+            print("[OmniPhiS2ST] LoRA speech adapter applied. Non-audio layers frozen.")
+        else:
+            print("[OmniPhiS2ST] Fine-tuned checkpoint loaded. LoRA weights preserved (set_lora_adapter skipped).")
 
         # ── Target Codec Block (frozen) ──────────────────────────────────────
         print("[OmniPhiS2ST] Loading VQGANEncoder (EnCodec)...")

@@ -18,14 +18,15 @@ for path in [omni_phi_dir, project_root]:
 
 from model import OmniPhiS2ST
 
-BATCH_TOKEN_LIMIT = 200   # tokens per chunk ≈ 5 seconds of audio at 1.5 kbps
-MAX_BATCHES       = 10    # hard cap: 10 chunks × 5s = ~50s of output max
+BATCH_TOKEN_LIMIT = 200   # tokens per chunk @ 150 tok/s (75 frames/s × 2 codebooks) ≈ 1.3 s audio
+MAX_BATCHES       = 10    # hard cap: 10 chunks × 1.3 s ≈ 13 s of output max
 
 def translate_speech(source_wav_path: str, output_wav_path: str = "output.wav", model: OmniPhiS2ST = None,
                      max_new_tokens: int = 200):
     """
     Load a fine-tuned OmniPhiS2ST checkpoint and translate an audio file.
-    max_new_tokens: upper limit on generated audio tokens (200 ≈ 5s at 1.5 kbps).
+    max_new_tokens: upper limit on generated audio tokens.
+    At 1.5 kbps (75 frames/s × 2 codebooks): 200 tok ≈ 1.3 s, 800 tok ≈ 5.3 s.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -56,8 +57,13 @@ def translate_speech(source_wav_path: str, output_wav_path: str = "output.wav", 
 def translate_speech_batched(model: OmniPhiS2ST, source_audio: np.ndarray, source_sr: int = 16000,
                              max_batches: int = MAX_BATCHES):
     """
-    Translates in chunks of BATCH_TOKEN_LIMIT tokens, up to max_batches chunks.
-    Concatenates all chunk waveforms into the final output.
+    Translates using repeated generate_speech calls capped at BATCH_TOKEN_LIMIT tokens each,
+    concatenating chunk waveforms into the final output.
+
+    NOTE: Each chunk is an independent forward pass on the same source audio.
+    This is useful for very long audio where a single generate call would OOM.
+    For sentence-length inputs (FLEURS), use model.generate_speech() directly
+    with max_new_tokens=800 instead.
     """
     all_waveforms = []
 
