@@ -1,13 +1,12 @@
 import sys
 import os
+import argparse
 from pathlib import Path
 import torch
 from transformers import TrainingArguments
 
 # Resolve paths relative to this script's directory for maximum robustness
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR   = SCRIPT_DIR / "data" / "preprocessed"
-OUTPUT_DIR = SCRIPT_DIR / "checkpoints"
 
 # Add models/omni_phi and the project root to sys.path to allow imports from any CWD
 omni_phi_dir = str(SCRIPT_DIR)
@@ -21,31 +20,68 @@ from dataset  import OmniPhiDataset
 from collator import omni_phi_collate_fn
 from trainer  import OmniPhiTrainer
 
-MODEL_ID    = "microsoft/Phi-4-multimodal-instruct"
+MODEL_ID = "microsoft/Phi-4-multimodal-instruct"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train OmniPhiS2ST for a given target language."
+    )
+    parser.add_argument(
+        "--lang_tgt",
+        type=str,
+        default="de",
+        help="Target language ISO prefix, e.g. 'de', 'fr', 'it' (default: 'de'). "
+             "Must match an entry in lang_config.LANG_CONFIG.",
+    )
+    return parser.parse_args()
+
 
 def main():
+    args = parse_args()
+    lang_tgt = args.lang_tgt
+
+    # ── Derive language-namespaced directories ────────────────────────────────
+    DATA_DIR   = SCRIPT_DIR / "data" / f"preprocessed_en_{lang_tgt}"
+    OUTPUT_DIR = SCRIPT_DIR / f"checkpoints_en_{lang_tgt}"
+
     print("=== Omni-Phi S2ST Training ===")
-    print(f"Model ID  : {MODEL_ID}")
-    print(f"Data Dir  : {DATA_DIR}")
-    print(f"Output Dir: {OUTPUT_DIR}")
+    print(f"Model ID   : {MODEL_ID}")
+    print(f"Language   : en -> {lang_tgt}")
+    print(f"Data Dir   : {DATA_DIR}")
+    print(f"Output Dir : {OUTPUT_DIR}")
     print("==============================\n")
 
-    # ── 1. Load model (LoRA adapter applied inside __init__) ────────────────
+    if not DATA_DIR.exists() or not any(DATA_DIR.iterdir()):
+        print(
+            f"[train.py] ERROR: Data directory '{DATA_DIR}' is empty or does not exist.\n"
+            f"           Run: python preprocess_omni.py --lang_tgt {lang_tgt} --split train\n"
+            f"           then: python preprocess_omni.py --lang_tgt {lang_tgt} --split eval"
+        )
+        sys.exit(1)
+
+    # ── 1. Load model (LoRA adapter applied inside __init__) ──────────────────
     device = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    model = OmniPhiS2ST(phi4_model_id=MODEL_ID, device=device)
+    model = OmniPhiS2ST(phi4_model_id=MODEL_ID, device=device, lang_prefix=lang_tgt)
 
-    # ── 2. Load datasets ────────────────────────────────────────────────────
-    train_dataset = OmniPhiDataset(str(DATA_DIR / "train.jsonl"), model.processor, training=True)
+    # ── 2. Load datasets ──────────────────────────────────────────────────────
+    train_dataset = OmniPhiDataset(
+        str(DATA_DIR / "train.jsonl"), model.processor,
+        training=True, lang_prefix=lang_tgt,
+    )
     eval_jsonl_path = DATA_DIR / "eval.jsonl"
     if eval_jsonl_path.exists():
-        eval_dataset = OmniPhiDataset(str(eval_jsonl_path), model.processor, training=False)
+        eval_dataset = OmniPhiDataset(
+            str(eval_jsonl_path), model.processor,
+            training=False, lang_prefix=lang_tgt,
+        )
     else:
         print(f"[train.py] {eval_jsonl_path} not found. Skipping evaluation dataset.")
         eval_dataset = None
 
-    # ── 3. Training arguments (mirrors the official Phi-4 script) ───────────
-    # ── Detect if fused AdamW is supported (requires CUDA + torch >= 2.0) ────
+    # ── 3. Training arguments (mirrors the official Phi-4 script) ─────────────
+    # ── Detect if fused AdamW is supported (requires CUDA + torch >= 2.0) ─────
     use_fused_adam = (
         torch.cuda.is_available()
         and hasattr(torch.optim, "AdamW")
@@ -83,7 +119,7 @@ def main():
         ddp_find_unused_parameters   = False,        # LoRA only trains a subset; set True only for DDP multi-GPU
     )
 
-    # ── 4. Instantiate Trainer ───────────────────────────────────────────────
+    # ── 4. Instantiate Trainer ────────────────────────────────────────────────
     trainer = OmniPhiTrainer(
         model         = model,
         args          = training_args,
@@ -92,7 +128,7 @@ def main():
         eval_dataset  = eval_dataset,
     )
 
-    # ── 5. Train ─────────────────────────────────────────────────────────────
+    # ── 5. Train ──────────────────────────────────────────────────────────────
     trainer.train()
     trainer.save_model(str(OUTPUT_DIR))
     # Save processor (Phi4MMProcessor.save_pretrained crashes in transformers 4.57.3
@@ -104,6 +140,7 @@ def main():
             model.processor.tokenizer.save_pretrained(str(OUTPUT_DIR))
             print("[train.py] Saved tokenizer (processor.save_pretrained skipped due to Phi4MM bug).")
     print(f"[train.py] Training complete. Checkpoint saved to {OUTPUT_DIR}")
+
 
 if __name__ == "__main__":
     main()

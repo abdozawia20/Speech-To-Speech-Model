@@ -73,7 +73,7 @@ def main():
     
     # Establish output directory
     if args.output_dir is None:
-        out_dir = Path(os.path.dirname(__file__)) / "data" / "preprocessed"
+        out_dir = Path(os.path.dirname(__file__)) / "data" / f"preprocessed_en_{args.lang_tgt}"
     else:
         out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

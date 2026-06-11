@@ -7,9 +7,14 @@ from torch.utils.data import Dataset
 from transformers import AutoProcessor
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import sys as _sys
+_omni_phi_dir = os.path.dirname(os.path.abspath(__file__))
+if _omni_phi_dir not in _sys.path:
+    _sys.path.insert(0, _omni_phi_dir)
+from lang_config import get_lang_name
+
 ANSWER_SUFFIX = "<|end|><|endoftext|>"
 IGNORE_INDEX  = -100
-INSTRUCTION   = "Translate this to spoken german:"
 
 class OmniPhiDataset(Dataset):
     """
@@ -24,21 +29,28 @@ class OmniPhiDataset(Dataset):
     essentially I/O-bound rather than CPU-bound.
     """
 
-    def __init__(self, jsonl_path: str, processor: AutoProcessor, training: bool = True):
+    def __init__(self, jsonl_path: str, processor: AutoProcessor, training: bool = True,
+                 lang_prefix: str = "de"):
         self.jsonl_path = jsonl_path
         self.processor  = processor
         self.training   = training
         self.offsets    = []
+        self.lang_prefix = lang_prefix
 
-        # Cache directory lives alongside the JSONL file
+        # Derive instruction from lang_prefix (e.g. "de" → "Translate this to spoken german:")
+        lang_name   = get_lang_name(lang_prefix)
+        instruction = f"Translate this to spoken {lang_name}:"
+
+        # Cache directory lives alongside the JSONL file, namespaced by language pair
+        # so switching target languages never produces cross-language cache collisions.
         split = "train" if training else "eval"
-        self.cache_dir = Path(jsonl_path).parent / f".cache_{split}"
+        self.cache_dir = Path(jsonl_path).parent / f".cache_{split}_en_{lang_prefix}"
         self.cache_dir.mkdir(exist_ok=True)
 
         # Pre-compute the static prompt text once (avoids repeated tokenizer calls)
         user_message = {
             "role": "user",
-            "content": f"<|audio_1|>\n{INSTRUCTION}",
+            "content": f"<|audio_1|>\n{instruction}",
         }
         self._prompt_text = self.processor.tokenizer.apply_chat_template(
             [user_message], tokenize=False, add_generation_prompt=True

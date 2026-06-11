@@ -5,6 +5,17 @@ import torch.nn as nn
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+# Add project root to sys.path *before* any local imports so that
+# lang_config and encoders can always be found regardless of CWD.
+_project_root_early = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _project_root_early not in sys.path:
+    sys.path.append(_project_root_early)
+_omni_phi_dir_early = os.path.dirname(os.path.abspath(__file__))
+if _omni_phi_dir_early not in sys.path:
+    sys.path.insert(0, _omni_phi_dir_early)
+
+from lang_config import get_lang_name
+
 # Enable TF32 on A100 for free ~10-20% speedup on matrix multiplications
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -113,7 +124,7 @@ class OmniPhiS2ST(nn.Module):
     PHI4_HUB_ID   = "microsoft/Phi-4-multimodal-instruct"
 
     def __init__(self, phi4_model_id: str = PHI4_MODEL_ID, device: str = "cuda",
-                 is_finetuned: bool | None = None):
+                 is_finetuned: bool | None = None, lang_prefix: str = "de"):
         """
         Args:
             phi4_model_id:  Hub ID or local path to load the Phi-4 backbone from.
@@ -128,6 +139,9 @@ class OmniPhiS2ST(nn.Module):
         """
         super().__init__()
         self.device = device
+        self.lang_prefix = lang_prefix
+        self._lang_name  = get_lang_name(lang_prefix)   # e.g. "german"
+        print(f"[OmniPhiS2ST] Target language: {lang_prefix} ({self._lang_name})")
 
         # ── Auto-detect whether we are loading a fine-tuned checkpoint ───────
         if is_finetuned is None:
@@ -297,7 +311,10 @@ class OmniPhiS2ST(nn.Module):
         max_new_tokens: int = 400,   # 400 tokens ≈ 10s audio; 200 was too short for most sentences
     ) -> np.ndarray:
         """
-        End-to-end inference: English audio → german audio waveform.
+        End-to-end inference: English audio → target language audio waveform.
+
+        The target language is determined by the `lang_prefix` passed at
+        construction time (default: ``"de"`` → German).
 
         Args:
             source_audio:   Raw float32 numpy array at source_sr Hz.
@@ -330,7 +347,7 @@ class OmniPhiS2ST(nn.Module):
         # ── Step 1: Build prompt and process source audio ───────────────────
         user_message = {
             "role": "user",
-            "content": "<|audio_1|>\nTranslate this to spoken german:",
+            "content": f"<|audio_1|>\nTranslate this to spoken {self._lang_name}:",
         }
         prompt_text = self.processor.tokenizer.apply_chat_template(
             [user_message], tokenize=False, add_generation_prompt=True

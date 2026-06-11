@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import argparse
 from tqdm import tqdm
 from transformers import pipeline
 import evaluate
@@ -21,13 +22,14 @@ if OMNI_PHI_DIR not in sys.path:
 
 from model import OmniPhiS2ST
 from dataset_loader import load_data
+from lang_config import get_whisper_lang, LANG_CONFIG
 
 # ── Global configuration ─────────────────────────────────────────────────────
 # Change to 2000 for the full benchmark run.
 NUM_SAMPLES = 10
 
-ASR_MODEL_ID  = "openai/whisper-base"
-SPKREC_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+ASR_MODEL_ID   = "openai/whisper-base"
+SPKREC_SOURCE  = "speechbrain/spkrec-ecapa-voxceleb"
 SPKREC_SAVEDIR = os.path.join(OMNI_PHI_DIR, "tmp_spkrec")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -50,38 +52,52 @@ def analyze(
     num_samples: int = NUM_SAMPLES,
     checkpoint_path: str = None,
     output_file: str = None,
+    lang_tgt: str = "de",
 ):
     """
-    End-to-end evaluation of OmniPhiS2ST on the FLEURS en→de benchmark.
+    End-to-end evaluation of OmniPhiS2ST on the FLEURS en→{lang_tgt} benchmark.
 
     Pipeline:
-        1. Load OmniPhiS2ST from checkpoint_path.
-        2. Load FLEURS en_us + de_de via dataset_loader.load_data().
+        1. Load OmniPhiS2ST from checkpoint_path (defaults to checkpoints_en_{lang_tgt}/).
+        2. Load FLEURS en_us + {lang_tgt} via dataset_loader.load_data().
         3. For each matched sample:
-               a. model.generate_speech(en_audio, source_sr, max_new_tokens=800) → de_audio (24 kHz)
+               a. model.generate_speech(en_audio, source_sr, max_new_tokens=800) → tgt_audio (24 kHz)
                   800 tokens @ 150 tok/s ≈ 5.3 s — enough headroom for any FLEURS sentence.
-               b. Resample de_audio → 16 kHz for speaker encoder
-               c. Whisper ASR(de_audio, language="de") → pred_text
-               d. Collect (pred_text, de_ref_text, en_src_text)
-               e. ECAPA cosine_similarity(en_audio_emb, de_audio_emb)
+               b. Resample tgt_audio → 16 kHz for speaker encoder
+               c. Whisper ASR(tgt_audio, language=whisper_lang) → pred_text
+               d. Collect (pred_text, tgt_ref_text, en_src_text)
+               e. ECAPA cosine_similarity(en_audio_emb, tgt_audio_emb)
         4. Compute BLEU, ROUGE, COMET (with sources), mean cosine similarity.
-        5. Save results to output_file (benchmarks/omni_phi.json).
+        5. Save results to output_file (benchmarks/omni_phi_en_{lang_tgt}.json).
 
     Args:
         num_samples:      Number of FLEURS samples to load per language.
                           Defaults to NUM_SAMPLES (10 for dev, 2000 for full run).
         checkpoint_path:  Path to fine-tuned OmniPhiS2ST checkpoint directory.
-                          Defaults to models/omni_phi/checkpoints/.
+                          Defaults to models/omni_phi/checkpoints_en_{lang_tgt}/.
         output_file:      Path to write the JSON results file.
-                          Defaults to benchmarks/omni_phi.json.
+                          Defaults to benchmarks/omni_phi_en_{lang_tgt}.json.
+        lang_tgt:         Target language ISO prefix (e.g. 'de', 'fr', 'it').
+                          Must match a key in lang_config.LANG_CONFIG.
     """
+    # ── Validate lang_tgt ─────────────────────────────────────────────────────
+    if lang_tgt not in LANG_CONFIG:
+        supported = ", ".join(sorted(LANG_CONFIG.keys()))
+        logger.error(
+            f"Unsupported lang_tgt '{lang_tgt}'. Supported languages: {supported}."
+        )
+        sys.exit(1)
+
+    whisper_lang = get_whisper_lang(lang_tgt)
+
     # ── Resolve paths ─────────────────────────────────────────────────────────
     if checkpoint_path is None:
-        checkpoint_path = os.path.join(OMNI_PHI_DIR, "checkpoints")
+        checkpoint_path = os.path.join(OMNI_PHI_DIR, f"checkpoints_en_{lang_tgt}")
 
     if output_file is None:
-        output_file = os.path.join(PROJECT_ROOT, "benchmarks", "omni_phi.json")
+        output_file = os.path.join(PROJECT_ROOT, "benchmarks", f"omni_phi_en_{lang_tgt}.json")
 
+    logger.info(f"Language pair   : en → {lang_tgt}  (Whisper tag: '{whisper_lang}')")
     logger.info(f"Checkpoint path : {checkpoint_path}")
     logger.info(f"Output file     : {output_file}")
     logger.info(f"Num samples     : {num_samples}")
@@ -89,7 +105,8 @@ def analyze(
     if not os.path.exists(checkpoint_path) or not os.listdir(checkpoint_path):
         logger.error(
             f"Checkpoint directory '{checkpoint_path}' is empty or does not exist. "
-            "Please copy the fine-tuned weights there before running evaluation."
+            f"Please copy the fine-tuned weights there before running evaluation.\n"
+            f"Expected location: {checkpoint_path}"
         )
         sys.exit(1)
 
@@ -98,30 +115,34 @@ def analyze(
     logger.info(f"Using device: {device}")
     logger.info(f"Loading OmniPhiS2ST from {checkpoint_path}...")
 
-    model = OmniPhiS2ST(phi4_model_id=checkpoint_path, device=device)
+    model = OmniPhiS2ST(
+        phi4_model_id=checkpoint_path,
+        device=device,
+        lang_prefix=lang_tgt,
+    )
     model.eval()
 
     # ── 2. Load FLEURS datasets ───────────────────────────────────────────────
-    logger.info("Loading FLEURS dataset (en + de)...")
+    logger.info(f"Loading FLEURS dataset (en + {lang_tgt})...")
     datasets = load_data(
-        lang=["en", "de"],
+        lang=["en", lang_tgt],
         split="train",
         num_samples=num_samples,
         dataset=["fleurs"],
     )
 
-    en_ds = datasets.get("en")
-    de_ds = datasets.get("de")
+    en_ds  = datasets.get("en")
+    tgt_ds = datasets.get(lang_tgt)
 
-    if not en_ds or not de_ds:
-        logger.error("Failed to load FLEURS datasets for 'en' or 'de'.")
+    if not en_ds or not tgt_ds:
+        logger.error(f"Failed to load FLEURS datasets for 'en' or '{lang_tgt}'.")
         sys.exit(1)
 
-    logger.info(f"Loaded {len(en_ds)} en samples, {len(de_ds)} de samples.")
-    num_pairs = min(len(en_ds), len(de_ds))
+    logger.info(f"Loaded {len(en_ds)} en samples, {len(tgt_ds)} {lang_tgt} samples.")
+    num_pairs = min(len(en_ds), len(tgt_ds))
 
     # ── 3. Initialise ASR (Whisper) ───────────────────────────────────────────
-    logger.info("Initialising ASR (Whisper) for transcription of generated audio...")
+    logger.info(f"Initialising ASR (Whisper) for transcription (language='{whisper_lang}')...")
     asr_pipeline = pipeline(
         "automatic-speech-recognition",
         model=ASR_MODEL_ID,
@@ -152,11 +173,11 @@ def analyze(
     except Exception as e:
         logger.warning(f"Failed to load speaker classifier: {e}. Cosine similarity will be skipped.")
 
-    # ── 6. Inference loop (en → de) ───────────────────────────────────────────
-    logger.info("Starting en → de evaluation loop...")
+    # ── 6. Inference loop (en → lang_tgt) ─────────────────────────────────────
+    logger.info(f"Starting en → {lang_tgt} evaluation loop...")
 
-    predictions   = []   # Whisper transcription of generated de audio
-    references    = []   # Ground-truth de transcriptions (from FLEURS)
+    predictions   = []   # Whisper transcription of generated target audio
+    references    = []   # Ground-truth target transcriptions (from FLEURS)
     sources       = []   # Ground-truth en transcriptions (for COMET)
     cos_sims      = []   # ECAPA cosine similarities
 
@@ -171,12 +192,12 @@ def analyze(
             return int(obj)
         raise TypeError(f"Object of type {type(obj)} is not JSON serialisable")
 
-    for i in tqdm(range(num_pairs), desc="en→de"):
-        en_item = en_ds[i]
-        de_item = de_ds[i]
+    for i in tqdm(range(num_pairs), desc=f"en→{lang_tgt}"):
+        en_item  = en_ds[i]
+        tgt_item = tgt_ds[i]
 
-        en_src_text = en_item.get("transcription", "")
-        de_ref_text = de_item.get("transcription", "")
+        en_src_text  = en_item.get("transcription", "")
+        tgt_ref_text = tgt_item.get("transcription", "")
 
         en_audio = np.array(en_item["audio"]["array"], dtype=np.float32)
         en_sr    = en_item["audio"]["sampling_rate"]
@@ -187,22 +208,22 @@ def analyze(
             # A single generate_speech call is correct here; translate_speech_batched
             # re-translates the same audio on every chunk and would produce
             # nonsense concatenations for sentence-length FLEURS inputs.
-            de_audio = model.generate_speech(en_audio, source_sr=en_sr, max_new_tokens=800)
-            # de_audio is float32 numpy at 24 kHz
+            tgt_audio = model.generate_speech(en_audio, source_sr=en_sr, max_new_tokens=800)
+            # tgt_audio is float32 numpy at 24 kHz
 
             # ── b. Resample generated audio to 16 kHz for ASR + speaker emb ─
-            de_audio_16k = _resample_to_16k(de_audio, orig_sr=GENERATED_SR)
+            tgt_audio_16k = _resample_to_16k(tgt_audio, orig_sr=GENERATED_SR)
 
-            # ── c. ASR: transcribe generated German audio ─────────────────────
+            # ── c. ASR: transcribe generated target audio ──────────────────────
             asr_result = asr_pipeline(
-                {"array": de_audio_16k, "sampling_rate": 16000},
-                generate_kwargs={"language": "de"},
+                {"array": tgt_audio_16k, "sampling_rate": 16000},
+                generate_kwargs={"language": whisper_lang},
             )
             pred_text = asr_result["text"].strip()
 
             # ── d. Accumulate for text metrics ────────────────────────────────
             predictions.append(pred_text)
-            references.append(de_ref_text)
+            references.append(tgt_ref_text)
             sources.append(en_src_text)
 
             # ── e. ECAPA cosine similarity ─────────────────────────────────────
@@ -211,14 +232,14 @@ def analyze(
                     # ECAPA expects [batch, time] tensors at 16 kHz
                     en_audio_16k = _resample_to_16k(en_audio, orig_sr=en_sr)
 
-                    en_tensor = torch.tensor(en_audio_16k).unsqueeze(0).to(device)
-                    de_tensor = torch.tensor(de_audio_16k).unsqueeze(0).to(device)
+                    en_tensor  = torch.tensor(en_audio_16k).unsqueeze(0).to(device)
+                    tgt_tensor = torch.tensor(tgt_audio_16k).unsqueeze(0).to(device)
 
                     with torch.no_grad():
-                        en_emb = spk_classifier.encode_batch(en_tensor).squeeze().cpu().numpy()
-                        de_emb = spk_classifier.encode_batch(de_tensor).squeeze().cpu().numpy()
+                        en_emb  = spk_classifier.encode_batch(en_tensor).squeeze().cpu().numpy()
+                        tgt_emb = spk_classifier.encode_batch(tgt_tensor).squeeze().cpu().numpy()
 
-                    similarity = 1.0 - cosine(en_emb, de_emb)
+                    similarity = 1.0 - cosine(en_emb, tgt_emb)
                     cos_sims.append(float(similarity))
                 except Exception as e:
                     logger.warning(f"Cosine similarity failed at index {i}: {e}")
@@ -269,8 +290,9 @@ def analyze(
     avg_cos_sim = float(np.mean(cos_sims)) if cos_sims else 0.0
 
     # ── 8. Assemble and save results ──────────────────────────────────────────
+    pair_key = f"en_to_{lang_tgt}"
     final_scores = {
-        "en_to_de": {
+        pair_key: {
             "bleu":              bleu_score,
             "rouge":             rouge_score,
             "comet":             comet_score,
@@ -287,3 +309,35 @@ def analyze(
     print(json.dumps(final_scores, indent=4, default=_serialize))
 
     return final_scores
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Evaluate OmniPhiS2ST on the FLEURS benchmark for a given target language."
+    )
+    parser.add_argument(
+        "--lang_tgt", default="de",
+        help="Target language ISO prefix, e.g. 'de', 'fr', 'it' (default: 'de').",
+    )
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="Path to fine-tuned checkpoint directory. "
+             "Defaults to models/omni_phi/checkpoints_en_{lang_tgt}/.",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Path to write the JSON results file. "
+             "Defaults to benchmarks/omni_phi_en_{lang_tgt}.json.",
+    )
+    parser.add_argument(
+        "--num_samples", type=int, default=NUM_SAMPLES,
+        help=f"Number of FLEURS samples to evaluate (default: {NUM_SAMPLES}).",
+    )
+    args = parser.parse_args()
+
+    analyze(
+        num_samples=args.num_samples,
+        checkpoint_path=args.checkpoint,
+        output_file=args.output,
+        lang_tgt=args.lang_tgt,
+    )
