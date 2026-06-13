@@ -1,0 +1,189 @@
+import json
+import os
+import numpy as np
+import torch
+from pathlib import Path
+from torch.utils.data import Dataset
+from transformers import AutoProcessor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import sys as _sys
+_omni_phi_dir = os.path.dirname(os.path.abspath(__file__))
+if _omni_phi_dir not in _sys.path:
+    _sys.path.insert(0, _omni_phi_dir)
+from lang_config import get_lang_name
+
+ANSWER_SUFFIX = "<|end|><|endoftext|>"
+IGNORE_INDEX  = -100
+
+class OmniPhiDataset(Dataset):
+    """
+    Loads preprocessed (source_audio, target_tokens) pairs.
+    Formats them into the exact input structure expected by
+    Phi-4-multimodal-instruct for causal language model training.
+
+    Performance: On first run, processor feature extraction (WavLM mel
+    features) is computed once per sample and cached to .pt files next to
+    the JSONL.  Subsequent epochs/runs skip all CPU feature extraction and
+    just torch.load() the pre-computed tensors — making the DataLoader
+    essentially I/O-bound rather than CPU-bound.
+    """
+
+    def __init__(self, jsonl_path: str, processor: AutoProcessor, training: bool = True,
+                 lang_prefix: str = "de"):
+        self.jsonl_path = jsonl_path
+        self.processor  = processor
+        self.training   = training
+        self.offsets    = []
+        self.lang_prefix = lang_prefix
+
+        # Derive instruction from lang_prefix (e.g. "de" → "Translate this to spoken german:")
+        lang_name   = get_lang_name(lang_prefix)
+        instruction = f"Translate this to spoken {lang_name}:"
+
+        # Cache directory lives alongside the JSONL file, namespaced by language pair
+        # so switching target languages never produces cross-language cache collisions.
+        split = "train" if training else "eval"
+        self.cache_dir = Path(jsonl_path).parent / f".cache_{split}_en_{lang_prefix}"
+        self.cache_dir.mkdir(exist_ok=True)
+
+        # Pre-compute the static prompt text once (avoids repeated tokenizer calls)
+        user_message = {
+            "role": "user",
+            "content": f"<|audio_1|>\n{instruction}",
+        }
+        self._prompt_text = self.processor.tokenizer.apply_chat_template(
+            [user_message], tokenize=False, add_generation_prompt=True
+        )
+        self._answer_ids = self.processor.tokenizer(
+            ANSWER_SUFFIX, return_tensors="pt"
+        ).input_ids  # [1, suffix_len] — computed once
+
+        # Fast path: if every cache file already exists we can skip the
+        # JSONL byte-offset scan entirely.  The offsets are only needed by
+        # _compute_and_cache(), which is never called when cache is complete.
+        # We count contiguous {0..N-1}.pt files and use that as our length.
+        cached_count = 0
+        while (self.cache_dir / f"{cached_count}.pt").exists():
+            cached_count += 1
+
+        if cached_count > 0:
+            # Cheap sentinel: store zeros just to establish __len__.
+            # Actual byte offsets are irrelevant because _build_cache will
+            # find no missing files and return immediately.
+            self.offsets = [0] * cached_count
+            print(f"[OmniPhiDataset] Cache hit — {cached_count} samples found in "
+                  f"{self.cache_dir}. Skipping JSONL scan.")
+        else:
+            # Cache is empty (or partially built): scan the JSONL to build offsets
+            # so _compute_and_cache() can seek to each record.
+            print(f"[OmniPhiDataset] Scanning byte offsets from {jsonl_path} ...")
+            with open(jsonl_path, "rb") as f:
+                offset = 0
+                for line in f:
+                    if line.strip():
+                        self.offsets.append(offset)
+                    offset += len(line)
+            print(f"[OmniPhiDataset] Scanned {len(self.offsets)} records.")
+
+        # Pre-warm cache on construction (single-threaded, runs once)
+        self._build_cache()
+
+    def _build_cache(self):
+        """Run processor once per sample and persist tensors to disk.
+
+        When the fast path in __init__ detected a fully-populated cache,
+        self.offsets contains sentinel zeros and missing will be empty,
+        so this returns immediately without touching the JSONL.
+        """
+        missing = [i for i in range(len(self.offsets))
+                   if not (self.cache_dir / f"{i}.pt").exists()]
+        if not missing:
+            print(f"[OmniPhiDataset] Cache already complete ({len(self.offsets)} samples). Skipping.")
+            return
+
+        # Partial cache: offsets must be real (not sentinels) at this point
+        # because _compute_and_cache() will seek into the JSONL.
+        if any(o == 0 and i > 0 for i, o in enumerate(self.offsets)):
+            raise RuntimeError(
+                "[OmniPhiDataset] Cache is incomplete but byte offsets are sentinels. "
+                "Delete the cache directory and restart to rebuild from the JSONL."
+            )
+
+        # Determine optimal worker threads based on available CPU cores
+        num_workers = min(8, os.cpu_count() or 4)
+        print(f"[OmniPhiDataset] Rebuilding feature cache for {len(missing)} samples in parallel...")
+        print(f"                 Using {num_workers} parallel CPU worker threads...")
+
+        # Run multi-threaded caching
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(self._compute_and_cache, idx): idx for idx in missing}
+            
+            completed_count = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    future.result()
+                    completed_count += 1
+                    if completed_count % 500 == 0 or completed_count == len(missing):
+                        print(f"  Processed and cached {completed_count}/{len(missing)} samples...", flush=True)
+                except Exception as e:
+                    print(f"  [ERROR] Failed to cache sample index {idx}: {e}")
+
+        print(f"[OmniPhiDataset] Cache complete. Saved to {self.cache_dir}")
+
+    def _compute_and_cache(self, idx: int):
+        """Run AutoProcessor on one sample and save the result."""
+        offset = self.offsets[idx]
+        with open(self.jsonl_path, "rb") as f:
+            f.seek(offset)
+            line = f.readline()
+        record = json.loads(line.decode("utf-8"))
+
+        src_audio  = np.array(record["source_audio"], dtype=np.float32)
+        target_ids = record["target_tokens"]
+
+        inputs = self.processor(
+            text=self._prompt_text,
+            audios=[(src_audio, 16000)],
+            return_tensors="pt",
+        )
+
+        target_tensor   = torch.tensor(target_ids, dtype=torch.long).unsqueeze(0)
+        full_answer_ids = torch.cat([target_tensor, self._answer_ids], dim=1)
+
+        torch.save({
+            "input_ids":          inputs.input_ids,
+            # Store as bfloat16: halves cache file size and eliminates runtime
+            # dtype conversion in the collator. Phi-4 expects bfloat16 anyway.
+            "input_audio_embeds": inputs.input_audio_embeds.to(dtype=torch.bfloat16),
+            "audio_embed_sizes":  inputs.audio_embed_sizes,
+            "full_answer_ids":    full_answer_ids,
+        }, self.cache_dir / f"{idx}.pt")
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def __getitem__(self, idx):
+        # Load from cache — fast torch.load() instead of processor feature extraction
+        cached = torch.load(self.cache_dir / f"{idx}.pt", weights_only=True)
+
+        input_ids_prompt = cached["input_ids"]          # [1, prompt_len]
+        input_audio_embeds = cached["input_audio_embeds"]
+        audio_embed_sizes  = cached["audio_embed_sizes"]
+        full_answer_ids    = cached["full_answer_ids"]  # [1, N + suffix_len]
+
+        if self.training:
+            input_ids = torch.cat([input_ids_prompt, full_answer_ids], dim=1)
+            labels    = torch.full_like(input_ids, IGNORE_INDEX)
+            labels[:, -full_answer_ids.shape[1]:] = full_answer_ids
+        else:
+            input_ids = input_ids_prompt
+            labels    = full_answer_ids
+
+        return {
+            "input_ids":          input_ids,
+            "labels":             labels,
+            "input_audio_embeds": input_audio_embeds,
+            "audio_embed_sizes":  audio_embed_sizes,
+        }

@@ -4,7 +4,7 @@ torch
 librosa
 matplotlib
 transformers==4.57.3
-numpy
+numpy<2.0.0
 ipython
 vosk
 pyttsx3
@@ -19,3 +19,13 @@ fastapi
 uvicorn[standard]
 python-multipart
 jiwer
+torchvision
+backoff
+ipywidgets
+evaluate
+sacrebleu
+rouge-score
+pytorch-lightning==2.6.1
+entmax
+jsonargparse
+protobuf==5.28.3
