@@ -73,156 +73,130 @@ class Wav2VecEncoder(nn.Module):
         return outputs.last_hidden_state
 
 
+# Monkey-patch torchaudio for SpeechBrain compatibility
+import torchaudio
+if not hasattr(torchaudio, "list_audio_backends"):
+    torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+# Monkey-patch torch.amp.custom_fwd for SpeechBrain 1.1.0 compatibility
+if not hasattr(torch, "amp"):
+    # Create a dummy amp module if it doesn't exist (very old torch)
+    class DummyAMP:
+        def custom_fwd(self, fwd=None, **kwargs):
+            return fwd if fwd is not None else lambda f: f
+    torch.amp = DummyAMP()
+elif not hasattr(torch.amp, "custom_fwd"):
+    if hasattr(torch.cuda.amp, "custom_fwd"):
+        def _custom_fwd_patch(fwd=None, **kwargs):
+            kwargs.pop("device_type", None)
+            return torch.cuda.amp.custom_fwd(fwd, **kwargs)
+        torch.amp.custom_fwd = _custom_fwd_patch
+    else:
+        torch.amp.custom_fwd = lambda fwd=None, **kwargs: fwd if fwd is not None else lambda f: f
+
 class Wav2VecSpeechT5Encoder(nn.Module):
     """
-    A Wav2Vec2-based encoder designed to be compatible with the SpeechT5 model.
-
-    - encode(): Runs raw audio through facebook/wav2vec2-base-960h and returns
-      hidden states of shape (Batch, Seq_Len, 768). These hidden states can be
-      fed directly into SpeechT5's encoder projection layer.
-
-    - decode(): Takes hidden states and a speaker embedding and uses the SpeechT5
-      decoder + HiFi-GAN vocoder to reconstruct audio. Useful for unit testing
-      and verifying the quality of encoded representations.
-
-    Note: This encoder is frozen by default (feature extraction only).
-    Note: The decode() functionality requires SpeechT5ForSpeechToSpeech components.
+    Supports English, German, Italian, and French by leveraging the SpeechT5 Speech-to-Speech unified latent space.
+    Replaces the English-specific Wav2Vec2 with the SpeechT5 Encoder.
     """
+    ST5_MODEL = "microsoft/speecht5_vc"
+    VOCODER_MODEL = "microsoft/speecht5_hifigan"
 
-    WAV2VEC_MODEL = "facebook/wav2vec2-base-960h"
-    SPEECHT5_MODEL = "microsoft/speecht5_vc"
-    VOCODER_MODEL  = "microsoft/speecht5_hifigan"
-
-    def __init__(self, wav2vec_model_name: str = WAV2VEC_MODEL, speecht5_model_name: str = SPEECHT5_MODEL, vocoder_model_name: str  = VOCODER_MODEL, load_decoder: bool = True,
-    ):
+    def __init__(self, wav2vec_model_name: str = ST5_MODEL, speecht5_model_name: str = ST5_MODEL, vocoder_model_name: str = VOCODER_MODEL, load_decoder: bool = True):
         super(Wav2VecSpeechT5Encoder, self).__init__()
-
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # ------------------------------------------------------------------ #
-        # Wav2Vec2 Encoder (frozen)                                           #
-        # ------------------------------------------------------------------ #
-        print(f"[Wav2VecSpeechT5Encoder] Loading Wav2Vec2 processor from '{wav2vec_model_name}'...")
-        self.wav2vec_processor = Wav2Vec2Processor.from_pretrained(wav2vec_model_name)
-
-        print(f"[Wav2VecSpeechT5Encoder] Loading Wav2Vec2 model from '{wav2vec_model_name}'...")
-        self.wav2vec_model = Wav2Vec2Model.from_pretrained(wav2vec_model_name).to(self.device)
-
-        # Freeze encoder weights — we use it purely for feature extraction.
-        for param in self.wav2vec_model.parameters():
-            param.requires_grad = False
-        self.wav2vec_model.eval()
-
-        # ------------------------------------------------------------------ #
-        # SpeechT5 Decoder + Vocoder (optional — only for decode())          #
-        # ------------------------------------------------------------------ #
-        self.speecht5_model = None
+        
+        # 1. Load Unified Processor
+        self.processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
+        
+        # 2. Load Unified Model (Contains both Encoder and Decoder)
+        self.model = SpeechT5ForSpeechToSpeech.from_pretrained(speecht5_model_name).to(self.device)
+        
         self.vocoder = None
-
         if load_decoder:
-            print(f"[Wav2VecSpeechT5Encoder] Loading SpeechT5 model from '{speecht5_model_name}'...")
-            self.speecht5_processor = SpeechT5Processor.from_pretrained(speecht5_model_name)
-            self.speecht5_model = SpeechT5ForSpeechToSpeech.from_pretrained(speecht5_model_name).to(self.device)
-            self.speecht5_model.eval()
-
-            print(f"[Wav2VecSpeechT5Encoder] Loading HiFi-GAN vocoder from '{vocoder_model_name}'...")
             self.vocoder = SpeechT5HifiGan.from_pretrained(vocoder_model_name).to(self.device)
             self.vocoder.eval()
+            
+        self.model.eval()
 
-    # ---------------------------------------------------------------------- #
-    # Public API                                                              #
-    # ---------------------------------------------------------------------- #
+        # Speaker recognition for embedding extraction
+        self.spk_classifier = None
+
+    def get_speaker_embedding(self, audio_array: np.ndarray, sr: int = 16000) -> torch.Tensor:
+        """
+        Extracts a 512-dim x-vector from the provided audio.
+        """
+        if self.spk_classifier is None:
+            from speechbrain.inference.speaker import EncoderClassifier
+            self.spk_classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-xvect-voxceleb",
+                savedir="tmp_spkrec",
+                run_opts={"device": self.device}
+            )
+        
+        with torch.no_grad():
+            audio_tensor = torch.from_numpy(audio_array).float().to(self.device)
+            # Add batch dimension
+            if audio_tensor.dim() == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            
+            # Extract embedding
+            embeddings = self.spk_classifier.encode_batch(audio_tensor)
+            embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
+            embeddings = embeddings.squeeze(1) # (batch, 512)
+        
+        return embeddings.cpu()
 
     def encode(self, audio_array: np.ndarray, sr: int = 16000) -> torch.Tensor:
-        """
-        Encode a single raw-audio waveform into Wav2Vec2 hidden states.
-
-        Args:
-            audio_array: 1-D numpy array of float32 waveform samples.
-            sr:          Sampling rate of the waveform (will be resampled to 16 kHz
-                         via the processor if needed).
-
-        Returns:
-            hidden_states: Tensor of shape (1, Seq_Len, 768) on CPU.
-        """
+        """ Extracts hidden states that the decoder ACTUALLY understands. """
         if audio_array.ndim > 1:
             audio_array = audio_array.flatten()
-
-        # Wav2Vec2Processor normalises the signal; resample if needed
-        inputs = self.wav2vec_processor(
-            audio_array,
-            sampling_rate=sr,
-            return_tensors="pt",
-            padding=False,
-        )
-        input_values = inputs.input_values.to(self.device)   # (1, T)
-
+            
+        inputs = self.processor(audio=audio_array, sampling_rate=sr, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            outputs = self.wav2vec_model(input_values)
-
-        # Shape: (1, Seq_Len, 768)  — returned to CPU so it can be stored/serialised
-        return outputs.last_hidden_state.cpu()
+            # We use the internal speecht5 encoder specifically
+            encoder_outputs = self.model.speecht5.encoder(
+                input_values=inputs.input_values,
+                attention_mask=inputs.attention_mask
+            )
+        return encoder_outputs.last_hidden_state.cpu() # (1, Seq_Len, 768)
 
     def encode_batch(self, audio_arrays: list, sr: int = 16000) -> list:
         """
         Encode a list of variable-length raw-audio waveforms.
-
-        Args:
-            audio_arrays: List of 1-D numpy arrays.
-            sr:           Common sampling rate for all arrays.
-
-        Returns:
-            List of numpy arrays, each of shape (Seq_Len, 768).
         """
         flat = [np.array(a, dtype=np.float32).flatten() for a in audio_arrays]
 
-        inputs = self.wav2vec_processor(
-            flat,
+        inputs = self.processor(
+            audio=flat,
             sampling_rate=sr,
             return_tensors="pt",
-            padding=True,           # pad to longest in batch
+            padding=True,
         )
         input_values  = inputs.input_values.to(self.device)
         attention_mask = inputs.attention_mask.to(self.device) if hasattr(inputs, "attention_mask") else None
 
         with torch.no_grad():
-            outputs = self.wav2vec_model(
-                input_values,
+            outputs = self.model.speecht5.encoder(
+                input_values=input_values,
                 attention_mask=attention_mask,
             )
 
-        # (Batch, Seq_Len, 768) → list of (Seq_Len_i, 768) numpy arrays (unpadded)
         hidden_states = outputs.last_hidden_state.cpu()  # (B, S, 768)
         result = []
         for i in range(hidden_states.size(0)):
             result.append(hidden_states[i].numpy())       # (S, 768)
         return result
 
-    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor,
-               threshold: float = 0.5, minlenratio: float = 0.0,
-               maxlenratio: float = 2.0) -> np.ndarray:
+    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor, **kwargs) -> np.ndarray:
         """
-        Reconstruct audio from Wav2Vec2 hidden states using the SpeechT5 decoder.
-
-        Uses transformer_enc.forward() — matching model.py:_encode_wav2vec_states —
-        so LayerNorm, dropout, and relative position_bias are applied consistently
-        with training.
-
-        Args:
-            hidden_states:     Tensor  (1, Seq_Len, 768).
-            speaker_embedding: Tensor  (512,)  or  (1, 512).
-            threshold:         Stop-token probability threshold (lower → longer output).
-            minlenratio, maxlenratio: Output length relative to encoder seq length.
-
-        Returns:
-            Reconstructed waveform as a numpy float32 array at 16 kHz.
+        Decodes hidden states into a speech waveform using the SpeechT5 decoder.
+        The latent space is shared with the encoder, eliminating the 'drone' artifact.
+        Mirrors the official `_generate_speech` function from the transformers library.
         """
-        if self.speecht5_model is None or self.vocoder is None:
-            raise RuntimeError(
-                "Decoder components were not loaded. "
-                "Re-initialise with load_decoder=True to use decode()."
-            )
-
+        if self.vocoder is None:
+             raise RuntimeError("Vocoder not loaded. Initialize with load_decoder=True.")
+             
         # ── normalise input shapes ────────────────────────────────────────── #
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(0)      # (1, S, 768)
@@ -233,85 +207,92 @@ class Wav2VecSpeechT5Encoder(nn.Module):
         speaker_embedding = speaker_embedding.to(self.device)
 
         with torch.no_grad():
-            # ── 1. SpeechT5 transformer encoder ──────────────────────────── #
-            # Use full forward() so LayerNorm, dropout & position_bias are
-            # applied — same as model.py:_encode_wav2vec_states.
-            encoder_obj = self.speecht5_model.speecht5.encoder
-            transformer_enc = (
-                encoder_obj.wrapped_encoder
-                if hasattr(encoder_obj, "wrapped_encoder")
-                else encoder_obj
-            )
+            # Manual autoregressive decoding loop to bypass redundant encoding.
+            # This logic mirrors transformers.models.speecht5.modeling_speecht5._generate_speech
+            config = self.model.config
+            num_mel_bins = config.num_mel_bins
+            reduction_factor = config.reduction_factor
+            
+            # Use thresholds/ratios from kwargs or defaults.
+            # NOTE: maxlenratio default is 20.0 (matching _generate_speech), NOT 2.0.
+            # A value of 2.0 causes extremely early termination and clipped audio.
+            #
+            # For long inputs (>10s), speecht5_vc's cross-attention may only cover
+            # ~50% of encoder frames before the stop token fires, producing audio
+            # that is shorter than the source. Setting disable_stop_token=True forces
+            # generation up to maxlenratio and is recommended for reconstruction use.
+            threshold = kwargs.get("threshold", 0.5)
+            minlenratio = kwargs.get("minlenratio", 0.0)
+            maxlenratio = kwargs.get("maxlenratio", 20.0)
+            if kwargs.get("disable_stop_token", False):
+                threshold = 1.1  # above sigmoid max — stop token never fires
 
-            # All tokens real (no padding in single-sample inference)
-            enc_mask = torch.ones(
-                hidden_states.shape[:2], dtype=torch.long, device=self.device
-            )
-            enc_out = transformer_enc(
-                hidden_states=hidden_states,
-                attention_mask=enc_mask,
-                return_dict=True,
-            )
-            encoder_states = enc_out.last_hidden_state   # (1, S, 768)
+            enc_len = hidden_states.shape[1]
+            min_steps = int(minlenratio * enc_len / reduction_factor)
+            # When stop token is disabled, use a tighter maxlenratio so the decoder
+            # doesn't run all 1875 positional-encoding steps. The natural 1:1 ratio
+            # (one decoder step per encoder frame) is maxlenratio = RF = 2.0; we add
+            # 20% headroom → 1.2 * enc_len / RF  ≈  enc_len * 0.6 steps.
+            effective_maxlenratio = maxlenratio
+            if kwargs.get("disable_stop_token", False) and maxlenratio > 2.0:
+                effective_maxlenratio = kwargs.get("stop_disabled_maxlenratio", 1.2)
+            max_steps = int(effective_maxlenratio * enc_len / reduction_factor)
+            # Clamp to the decoder's positional encoding limit (config.max_speech_positions).
+            # output_sequence starts at length 1 and grows by 1 each step, so the
+            # absolute maximum is (max_speech_positions - 1) steps.
+            pos_limit = config.max_speech_positions - 1
+            max_steps = max(min(max_steps, pos_limit), min_steps + 1, 1)
 
-            # ── 2. Autoregressive decoding loop ──────────────────────────── #
-            config = self.speecht5_model.config
-            num_mel_bins     = config.num_mel_bins      # 80
-            reduction_factor = config.reduction_factor  # 2
-
-            enc_len   = encoder_states.shape[1]
-            min_steps = max(0, int(minlenratio * enc_len / reduction_factor))
-            max_steps = (
-                int(maxlenratio * enc_len / reduction_factor)
-                if maxlenratio > 0 else 1000
-            )
-            max_steps = max(max_steps, min_steps + 1, 1)
-
-            # Start with a single all-zero frame
-            dec_input = torch.zeros((1, 1, num_mel_bins), device=self.device)
+            # Start the output sequence with a mel spectrum that is all zeros.
+            output_sequence = hidden_states.new_zeros(1, 1, num_mel_bins)
             past_kv  = None
-            frames   = []   # list of (1, reduction_factor, 80)
+            spectrogram   = []
 
             for step in range(max_steps):
-                dec_hidden = self.speecht5_model.speecht5.decoder.prenet(
-                    dec_input, speaker_embedding
-                )
-                dec_out = self.speecht5_model.speecht5.decoder.wrapped_decoder(
+                # Run the decoder prenet on the entire output sequence.
+                dec_hidden = self.model.speecht5.decoder.prenet(output_sequence, speaker_embedding)
+                # Run the decoder layers on the last element of the prenet output.
+                dec_out = self.model.speecht5.decoder.wrapped_decoder(
                     hidden_states=dec_hidden[:, -1:],
                     attention_mask=None,
-                    encoder_hidden_states=encoder_states,
+                    encoder_hidden_states=hidden_states,
                     encoder_attention_mask=None,
                     past_key_values=past_kv,
                     use_cache=True,
                     return_dict=True,
                 )
-                last_h  = dec_out.last_hidden_state.squeeze(1)   # (1, 768)
+                last_h  = dec_out.last_hidden_state.squeeze(1)
                 past_kv = dec_out.past_key_values
 
-                # (1, RF * 80) → (1, RF, 80)
-                spec = self.speecht5_model.speech_decoder_postnet.feat_out(last_h)
+                # Predict the new mel spectrum for this step in the sequence.
+                spec = self.model.speech_decoder_postnet.feat_out(last_h)
                 spec = spec.view(1, reduction_factor, num_mel_bins)
-                frames.append(spec)
+                spectrogram.append(spec)
 
-                dec_input = torch.cat([dec_input, spec[:, -1:, :]], dim=1)
+                # Extend the output sequence with the new mel spectrum.
+                new_frame = spec[:, -1, :].view(1, 1, num_mel_bins)
+                output_sequence = torch.cat((output_sequence, new_frame), dim=1)
 
-                # stop-token (honoured only after min_steps)
-                # prob_out returns (1, reduction_factor) — use .max() not .item()
-                if step >= min_steps:
-                    stop_p = torch.sigmoid(
-                        self.speecht5_model.speech_decoder_postnet.prob_out(last_h)
-                    )
-                    if stop_p.max() > threshold:
-                        break
+                # Predict the probability that this is the stop token.
+                # Use max over reduction_factor frames: stop when the most confident
+                # sub-frame exceeds the threshold (Tacotron-2 semantics).
+                # NOTE: The HF _generate_speech uses sum(), but with reduction_factor=2
+                # that fires at avg per-frame prob of 0.25 — far too sensitive, causing
+                # output to be ~50% shorter than the source. max() is correct here.
+                prob = torch.sigmoid(self.model.speech_decoder_postnet.prob_out(last_h))
+                if step >= min_steps and torch.max(prob, dim=-1).values >= threshold:
+                    break
 
-            # ── 3. Assemble mel, apply postnet, vocoder ───────────────────── #
-            if not frames:
+            if not spectrogram:
                 return np.zeros(16000, dtype=np.float32)
 
-            # frames: list of (1, RF, 80)  →  (1, T, 80)
-            mel_out  = torch.cat(frames, dim=1)   # (1, N*RF, 80)
-            mel_post = self.speecht5_model.speech_decoder_postnet.postnet(mel_out)
-            speech   = self.vocoder(mel_post).squeeze()
+            # Assemble mel, apply postnet, vocoder
+            mel_out = torch.stack(spectrogram).transpose(0, 1).flatten(1, 2)  # (1, T * RF, 80)
+            
+            # The postnet method already handles transposition and the residual connection
+            mel_post = self.model.speech_decoder_postnet.postnet(mel_out)
+            
+            speech = self.vocoder(mel_post).squeeze()
 
         return speech.cpu().numpy()
 
@@ -361,7 +342,9 @@ class SpeechT5MelSpectrogramEncoder(nn.Module):
         self.processor = SpeechT5Processor.from_pretrained(model_name)
         
     def encode(self, audio_array, sr=16000):
-        inputs = self.processor(audio=audio_array, sampling_rate=sr)
+        # NOTE: Using audio_target=... is crucial to get mel spectrograms
+        # instead of normalized raw audio.
+        inputs = self.processor(audio_target=audio_array, sampling_rate=sr)
         return inputs.input_values
 
 
@@ -405,6 +388,32 @@ class WavLMSpeechT5Encoder(nn.Module):
             self.vocoder = SpeechT5HifiGan.from_pretrained(vocoder_model_name).to(self.device)
             self.vocoder.eval()
 
+        # Speaker recognition model — loaded lazily on first call to get_speaker_embedding
+        self.spk_classifier = None
+
+    def get_speaker_embedding(self, audio_array: np.ndarray, sr: int = 16000) -> torch.Tensor:
+        """
+        Extracts a 512-dim x-vector from the provided audio using SpeechBrain.
+        Identical API to Wav2VecSpeechT5Encoder.get_speaker_embedding.
+        """
+        if self.spk_classifier is None:
+            from speechbrain.inference.speaker import EncoderClassifier
+            self.spk_classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-xvect-voxceleb",
+                savedir="tmp_spkrec",
+                run_opts={"device": self.device}
+            )
+
+        with torch.no_grad():
+            audio_tensor = torch.from_numpy(audio_array).float().to(self.device)
+            if audio_tensor.dim() == 1:
+                audio_tensor = audio_tensor.unsqueeze(0)
+            embeddings = self.spk_classifier.encode_batch(audio_tensor)
+            embeddings = torch.nn.functional.normalize(embeddings, dim=-1)
+            embeddings = embeddings.squeeze(1)  # (batch, 512)
+
+        return embeddings.cpu()
+
     def encode(self, audio_array: np.ndarray, sr: int = 16000) -> torch.Tensor:
         if audio_array.ndim > 1:
             audio_array = audio_array.flatten()
@@ -427,7 +436,25 @@ class WavLMSpeechT5Encoder(nn.Module):
             result.append(hidden_states[i].numpy())
         return result
 
-    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor, threshold: float = 0.5, minlenratio: float = 0.0, maxlenratio: float = 2.0) -> np.ndarray:
+    def decode(self, hidden_states: torch.Tensor, speaker_embedding: torch.Tensor,
+               threshold: float = 0.5, minlenratio: float = 0.0, maxlenratio: float = 20.0,
+               disable_stop_token: bool = False) -> np.ndarray:
+        """
+        Decodes WavLM hidden states into a speech waveform using the SpeechT5 decoder.
+
+        WavLM features are injected directly into the cross-attention of the SpeechT5
+        decoder, bypassing the SpeechT5 encoder entirely. This avoids a latent space
+        mismatch that would occur from re-processing WavLM features through the
+        SpeechT5 encoder's self-attention layers.
+
+        Args:
+            disable_stop_token: If True, the stop-token check is bypassed and the
+                decoder runs until maxlenratio. Recommended for long inputs where the
+                cross-attention may not traverse the full encoder sequence.
+
+        NOTE: maxlenratio default is 20.0 (matching the official _generate_speech),
+        NOT 2.0. A value of 2.0 causes extremely early termination.
+        """
         if self.speecht5_model is None or self.vocoder is None:
             raise RuntimeError("Decoder components were not loaded.")
 
@@ -440,11 +467,11 @@ class WavLMSpeechT5Encoder(nn.Module):
         speaker_embedding = speaker_embedding.to(self.device)
 
         with torch.no_grad():
-            encoder_obj = self.speecht5_model.speecht5.encoder
-            transformer_enc = encoder_obj.wrapped_encoder if hasattr(encoder_obj, "wrapped_encoder") else encoder_obj
-            enc_mask = torch.ones(hidden_states.shape[:2], dtype=torch.long, device=self.device)
-            enc_out = transformer_enc(hidden_states=hidden_states, attention_mask=enc_mask, return_dict=True)
-            encoder_states = enc_out.last_hidden_state
+            # Feed WavLM hidden states DIRECTLY into the decoder cross-attention.
+            # Do NOT pass them through speecht5_model.speecht5.encoder (wrapped_encoder),
+            # as that adds a spurious self-attention projection that corrupts the
+            # WavLM latent space and causes severe audio quality degradation.
+            encoder_states = hidden_states
 
             config = self.speecht5_model.config
             num_mel_bins = config.num_mel_bins
@@ -452,8 +479,18 @@ class WavLMSpeechT5Encoder(nn.Module):
 
             enc_len = encoder_states.shape[1]
             min_steps = max(0, int(minlenratio * enc_len / reduction_factor))
-            max_steps = int(maxlenratio * enc_len / reduction_factor) if maxlenratio > 0 else 1000
-            max_steps = max(max_steps, min_steps + 1, 1)
+            # When stop token is disabled, use a tighter maxlenratio so the decoder
+            # doesn't run all 1875 positional-encoding steps.
+            effective_maxlenratio = maxlenratio
+            if disable_stop_token and maxlenratio > 2.0:
+                effective_maxlenratio = 1.2  # ~1:1 with 20% headroom
+            max_steps = int(effective_maxlenratio * enc_len / reduction_factor) if effective_maxlenratio > 0 else 1000
+            # Clamp to the decoder's positional encoding limit.
+            # dec_input starts at length 1 and grows by 1 each step.
+            pos_limit = config.max_speech_positions - 1
+            max_steps = max(min(max_steps, pos_limit), min_steps + 1, 1)
+            # Disable stop token by raising threshold above sigmoid max
+            eff_threshold = 1.1 if disable_stop_token else threshold
 
             dec_input = torch.zeros((1, 1, num_mel_bins), device=self.device)
             past_kv = None
@@ -480,8 +517,11 @@ class WavLMSpeechT5Encoder(nn.Module):
                 dec_input = torch.cat([dec_input, spec[:, -1:, :]], dim=1)
 
                 if step >= min_steps:
+                    # Use max over reduction_factor frames: stop when the most confident
+                    # sub-frame exceeds the threshold (Tacotron-2 semantics).
+                    # NOTE: sum() fires too early with reduction_factor=2 (avg threshold 0.25).
                     stop_p = torch.sigmoid(self.speecht5_model.speech_decoder_postnet.prob_out(last_h))
-                    if stop_p.max() > threshold:
+                    if torch.max(stop_p, dim=-1).values >= eff_threshold:
                         break
 
             if not frames:
